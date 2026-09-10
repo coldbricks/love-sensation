@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible problem with Love Sensation.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please use synthetic or non-sensitive examples. Remove personal filenames and paths from logs. Do not attach a private library, saved run, or the data folder.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the result you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include operation, image format, settings, and a sanitized error message if available.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version and environment
+      placeholder: Love Sensation version, Windows version, Python version, GPU or CPU
+    validations:
+      required: true

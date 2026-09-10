@@ -1,0 +1,6 @@
+# Setup.ps1 installs the matching PyTorch CUDA 12.8 runtime first.
+# Install application dependencies inside the project virtual environment.
+PySide6==6.11.2
+ultralytics==8.4.57
+Pillow>=11
+numpy>=2

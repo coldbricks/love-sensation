@@ -1,0 +1,30 @@
+# Local runtime, models, and private library metadata
+.venv/
+venv/
+models/
+data/
+reports/
+backups/
+originals/
+platinum-aero.ico
+.env
+.env.*
+!.env.example
+*.sqlite*
+*.wal.jsonl
+*.events.jsonl
+*.log
+
+# Build and development output
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
