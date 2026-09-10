@@ -20,6 +20,12 @@ jobs:
         python: ['3.12', '3.14']
     steps:
       - uses: actions/checkout@v6
+      - name: Install Linux Qt Multimedia runtime
+        if: runner.os == 'Linux'
+        # QtMultimedia links libpulse even when tests use fake audio players.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libpulse0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -35,6 +41,7 @@ jobs:
         run: |
           python -m pip check
           python -c "import torch, torchvision; print({'torch': torch.__version__, 'torchvision': torchvision.__version__, 'cuda_available': torch.cuda.is_available()}); assert torch.version.cuda is None"
+          python -c "from PySide6.QtMultimedia import QMediaPlayer; print('Qt Multimedia import ready; audio playback is not started.')"
       - name: Parse Windows setup without running installation
         if: runner.os == 'Windows'
         shell: pwsh

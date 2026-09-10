@@ -44,7 +44,9 @@ class SnapshotDetector:
 class PerformanceTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="platinum-pipeline-test-")
-        self.root = Path(self.temporary.name)
+        # Windows runners may expose TEMP through an 8.3 alias (RUNNER~1).
+        # Match the engine's canonical path spelling before comparing reads.
+        self.root = Path(self.temporary.name).resolve()
         self.source = self.root / "input"
         self.source.mkdir()
         self.destination = self.root / "output"
