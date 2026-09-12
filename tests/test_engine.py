@@ -470,6 +470,47 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             export_report(report, self.root / "bad.txt")
 
+    def test_select_categories_rank_modes(self):
+        dets = [
+            {"class": "FACE", "score": 0.95, "prominence": 0.30, "aspect": 1.0},
+            {"class": "BODY", "score": 0.70, "prominence": 0.85, "aspect": 1.5},
+            {"class": "PANORAMA", "score": 0.65, "prominence": 0.40, "aspect": 2.5},
+        ]
+        # In confidence rank mode: FACE (0.95) ranks highest
+        opts_conf = SortOptions(source=str(self.source), destination=str(self.destination), rank_mode="confidence", mode="best")
+        cats_conf = module._select_categories(dets, opts_conf)
+        self.assertEqual(cats_conf, ["FACE"])
+
+        # In prominence rank mode: BODY (0.85) ranks highest
+        opts_prom = SortOptions(source=str(self.source), destination=str(self.destination), rank_mode="prominence", mode="best")
+        cats_prom = module._select_categories(dets, opts_prom)
+        self.assertEqual(cats_prom, ["BODY"])
+
+        # In aspect rank mode: PANORAMA (2.5) ranks highest
+        opts_asp = SortOptions(source=str(self.source), destination=str(self.destination), rank_mode="aspect", mode="best")
+        cats_asp = module._select_categories(dets, opts_asp)
+        self.assertEqual(cats_asp, ["PANORAMA"])
+
+    def test_select_categories_threshold_filters(self):
+        dets = [
+            {"class": "TINY_FACE", "score": 0.90, "prominence": 0.05, "aspect": 0.9},
+            {"class": "PROMINENT_BODY", "score": 0.85, "prominence": 0.70, "aspect": 1.2},
+        ]
+        # min_prominence=0.20 excludes TINY_FACE
+        opts = SortOptions(source=str(self.source), destination=str(self.destination), min_prominence=0.20, mode="all")
+        cats = module._select_categories(dets, opts)
+        self.assertEqual(cats, ["PROMINENT_BODY"])
+
+        # min_aspect_ratio=1.5 excludes both: returns empty when include_unmatched=False
+        opts_high_aspect = SortOptions(source=str(self.source), destination=str(self.destination), min_aspect_ratio=1.5, mode="all", include_unmatched=False)
+        cats_high = module._select_categories(dets, opts_high_aspect)
+        self.assertEqual(cats_high, [])
+
+        # When include_unmatched=True, returns _Unmatched
+        opts_unmatched = SortOptions(source=str(self.source), destination=str(self.destination), min_aspect_ratio=1.5, mode="all", include_unmatched=True)
+        cats_unmatched = module._select_categories(dets, opts_unmatched)
+        self.assertEqual(cats_unmatched, ["_Unmatched"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,7 +34,11 @@ These checks use temporary copies of ordinary bundled sample photos. Run GPU ben
 | `platinum_sorter/detector.py` | Model provenance, decoding, batched detection, compute verification |
 | `platinum_sorter/face_crops.py` | Verified source reads and face-only crop export |
 | `platinum_sorter/crop_dialog.py` | Face preview and export controls |
-| `platinum_sorter/startup_audio.py` | Optional local audio cue and playback bounds |
+| `platinum_sorter/pmv_forge.py` | Beat-synchronized PMV sequence assembly and gapless XML export |
+| `platinum_sorter/video_engine.py` | Video probing, scene cut detection, compilation harvesting, takes manifest |
+| `platinum_sorter/audio_grid.py` | PyTorch GPU beat tracking, BPM hypothesis power grid, downbeats and drops |
+| `platinum_sorter/flight_report.py` | Cockpit dashboard HTML report generator with radar scope and search |
+| `platinum_sorter/metrics.py` | Scale-invariant prominence, WOW scoring, and temporal video profiling |
 | `platinum_sorter/contracts.py` | Shared options and result records |
 
 Preserve the review-before-apply workflow, filename collision handling, source hash checks, and move verification. Keep model and filesystem work off the interface thread. CUDA is the default numerical processing path when available; make fallback behavior visible.

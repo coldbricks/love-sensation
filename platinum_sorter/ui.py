@@ -347,6 +347,80 @@ class TaskWorker(QThread):
             self.failed.emit(str(exc) or type(exc).__name__)
 
 
+class StealthLoupe(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.setStyleSheet("""
+            QFrame {
+                background: #141418;
+                border: 1px solid #d8b477;
+                border-radius: 8px;
+                padding: 12px;
+                color: #f3eee4;
+            }
+            QLabel#gold { color: #e8c58a; font-weight: 700; font-size: 14px; }
+            QLabel#eyebrow { color: #c5b18f; font-size: 9px; font-weight: 700; letter-spacing: 1px; }
+            QLabel#muted { color: #aaa6aa; font-size: 11px; }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
+
+        top = QHBoxLayout()
+        self.type_pill = QLabel("STILL", objectName="eyebrow")
+        self.type_pill.setStyleSheet("background: #262329; border: 1px solid #655b4e; padding: 2px 6px; border-radius: 4px; color: #d8b477;")
+        top.addWidget(self.type_pill)
+        top.addStretch()
+        self.score_lbl = QLabel("0.00 WOW", objectName="gold")
+        top.addWidget(self.score_lbl)
+        layout.addLayout(top)
+
+        self.name_lbl = QLabel("", objectName="name")
+        self.name_lbl.setStyleSheet("font-weight: 600; font-size: 12px;")
+        layout.addWidget(self.name_lbl)
+
+        self.details_lbl = QLabel("", objectName="muted")
+        layout.addWidget(self.details_lbl)
+
+        self.cats_lbl = QLabel("", objectName="muted")
+        self.cats_lbl.setStyleSheet("color: #e0c58f; font-size: 11px;")
+        layout.addWidget(self.cats_lbl)
+
+    def show_for(self, result: ImageResult):
+        self.name_lbl.setText(Path(result.source).name)
+        m_type = getattr(result, "media_type", "still").upper()
+        self.type_pill.setText(m_type)
+        prom = getattr(result, "prominence", 0.0)
+        sustained = getattr(result, "sustained_wow", 0.0)
+        aspect = getattr(result, "aspect_ratio", 0.0)
+        if sustained > 0:
+            self.score_lbl.setText(f"{sustained:.2f} SUSTAINED (Peak {prom:.2f})")
+        else:
+            self.score_lbl.setText(f"{prom:.2f} WOW")
+
+        info_lines = []
+        if getattr(result, "duration_s", 0.0) > 0:
+            info_lines.append(f"Duration: {result.duration_s:.1f}s")
+        if getattr(result, "best_timestamp_s", 0.0) > 0:
+            info_lines.append(f"Peak: {result.best_timestamp_s:.1f}s")
+        if aspect > 0:
+            info_lines.append(f"Aspect: {aspect:.2f}")
+        if getattr(result, "best_box", None):
+            info_lines.append(f"Focus: {result.best_box}")
+        if getattr(result, "size", 0) > 0:
+            info_lines.append(f"Size: {result.size / 1024:.0f} KB")
+        self.details_lbl.setText(" • ".join(info_lines) or "Analyzing geometry")
+
+        cats = ", ".join(result.categories) if result.categories else "Unmatched"
+        self.cats_lbl.setText(f"Categories: {cats}")
+
+        from PySide6.QtGui import QCursor
+        pos = QCursor.pos()
+        self.move(pos.x() + 20, pos.y() + 10)
+        self.show()
+        self.raise_()
+
+
 class MainWindow(QMainWindow):
     engine_event = Signal(dict)
 
@@ -362,7 +436,7 @@ class MainWindow(QMainWindow):
                     QFontDatabase.addApplicationFont(str(font_path))
         self._brand = _brand_icon()
         self.setWindowIcon(self._brand)
-        self.setWindowTitle(f"Love Sensation {__version__} — Private image organizer")
+        self.setWindowTitle(f"Love Sensation {__version__} — Private media workstation")
         self.resize(1300, 840)
         self.setMinimumSize(1080, 720)
         self.setStyleSheet(STYLE)
@@ -377,6 +451,7 @@ class MainWindow(QMainWindow):
         self._plan_valid = False
         self._face_crops_valid = False
         self._face_crop_dialog = None
+        self._loupe: StealthLoupe | None = None
         self._categories: dict[str, QCheckBox] = {}
         self._settings_timer = QTimer(self)
         self._settings_timer.setSingleShot(True)
@@ -385,8 +460,6 @@ class MainWindow(QMainWindow):
         self._metrics_timer.setInterval(150)
         self._metrics_timer.timeout.connect(self._update_metrics)
         self._build_ui()
-        from .startup_audio import StartupAudioController
-        self._startup_audio = StartupAudioController(parent=self, data_dir=DATA_DIR)
         self.engine_event.connect(self._on_event)
         self._load_settings()
         self._connect_options()
@@ -428,13 +501,18 @@ class MainWindow(QMainWindow):
             step.setContentsMargins(0, 7, 0, 7)
             self.step_labels.append(step)
             side.addWidget(step)
-        side.addSpacing(24)
-        side.addWidget(_label("ATMOSPHERE", "eyebrow"))
-        side.addSpacing(6)
-        self.startup_audio_button = QPushButton("Startup music…")
-        self.startup_audio_button.setToolTip("Choose an optional opening bar from a local music file.")
-        self.startup_audio_button.clicked.connect(self._show_startup_music)
-        side.addWidget(self.startup_audio_button)
+        side.addSpacing(20)
+        side.addWidget(_label("WORKSTATION SUITE", "eyebrow"))
+        side.addSpacing(8)
+        self.pmv_forge_button = QPushButton("PMV Forge…")
+        self.pmv_forge_button.setToolTip("Auto-assemble beat-locked video edits to music.")
+        self.pmv_forge_button.clicked.connect(self._open_pmv_forge)
+        side.addWidget(self.pmv_forge_button)
+        self.harvester_button = QPushButton("Comp Harvester…")
+        self.harvester_button.setToolTip("Lossless scene-cut splitting for compilation videos.")
+        self.harvester_button.clicked.connect(self._open_harvester)
+        side.addWidget(self.harvester_button)
+        self.startup_audio_button = self.pmv_forge_button
         side.addStretch()
         privacy = _label("LOCAL & PRIVATE", "eyebrow")
         side.addWidget(privacy)
@@ -513,6 +591,7 @@ class MainWindow(QMainWindow):
         self.operation_combo = QComboBox()
         self.operation_combo.addItem("Copy originals", "copy")
         self.operation_combo.addItem("Move originals", "move")
+        self.operation_combo.addItem("Hardlink (NTFS zero-space)", "hardlink")
         self.operation_combo.setAccessibleName("File operation")
         for title, control in (("MATCHES", self.mode_combo), ("MIN. CONFIDENCE", self.confidence_spin), ("FILE OPERATION", self.operation_combo)):
             group = QVBoxLayout()
@@ -608,6 +687,10 @@ class MainWindow(QMainWindow):
         self.face_crops_button.setToolTip("Preview and export detected faces from a completed analysis.")
         self.face_crops_button.clicked.connect(self._open_face_crops)
         tools_row.addWidget(self.face_crops_button)
+        self.flight_report_button = QPushButton("Flight Report…")
+        self.flight_report_button.setToolTip("Open interactive HTML cockpit dashboard.")
+        self.flight_report_button.clicked.connect(self._open_flight_report)
+        tools_row.addWidget(self.flight_report_button)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search files or categories…")
         self.search_edit.setClearButtonEnabled(True)
@@ -771,6 +854,9 @@ class MainWindow(QMainWindow):
         self.open_run_button.setEnabled(not self._busy)
         self.open_button.setEnabled(not self._busy and bool(self.destination_edit.text().strip()))
         self.face_crops_button.setEnabled(not self._busy and self._face_crops_valid and _has_face_detection(self.report))
+        self.flight_report_button.setEnabled(not self._busy and self.report is not None and bool(self.report.results))
+        self.pmv_forge_button.setEnabled(not self._busy)
+        self.harvester_button.setEnabled(not self._busy)
 
     def _analyze(self):
         options = self._options()
@@ -965,7 +1051,69 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(destination)))
 
     def _show_startup_music(self):
-        self._startup_audio.show_settings(parent=self)
+        self._open_pmv_forge()
+
+    def _open_pmv_forge(self):
+        from .pmv_dialog import PmvForgeDialog
+        clips = []
+        if self.report and self.report.results:
+            for r in self.report.results:
+                if getattr(r, "media_type", "still") == "video" or r.source.lower().endswith((".mp4", ".mov", ".mkv", ".webm")):
+                    clips.append({
+                        "path": r.source,
+                        "duration_s": getattr(r, "duration_s", 5.0) or 5.0,
+                        "prominence": getattr(r, "prominence", 0.5) or 0.5,
+                        "sustained_wow": getattr(r, "sustained_wow", 0.0) or 0.0,
+                        "best_timestamp_s": getattr(r, "best_timestamp_s", 0.0) or 0.0,
+                        "aspect_ratio": getattr(r, "aspect_ratio", 1.0) or 1.0,
+                        "categories": r.categories,
+                    })
+        dialog = PmvForgeDialog(parent=self, candidate_clips=clips)
+        dialog.exec()
+
+    def _open_harvester(self):
+        from .harvester_dialog import CompHarvesterDialog
+        dialog = CompHarvesterDialog(parent=self)
+        dialog.exec()
+
+    def _open_flight_report(self):
+        if not self.report or not self.report.results:
+            QMessageBox.information(self, "Flight Report", "Run an analysis first to generate a flight report.")
+            return
+        from .flight_report import generate_flight_report
+        report_dir = DATA_DIR / "runs"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / f"flight_report_{self.report.run_id[:8]}.html"
+        results_dicts = [r.__dict__ if hasattr(r, "__dict__") else r for r in self.report.results]
+        generate_flight_report("Love Sensation — Flight Report", report_path, results_dicts)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(report_path)))
+
+    def _toggle_stealth_loupe(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return
+        result = self.proxy.data(rows[0], Qt.ItemDataRole.UserRole)
+        if not result:
+            return
+        if self._loupe is None:
+            self._loupe = StealthLoupe(self)
+        if self._loupe.isVisible() and getattr(self._loupe, "_current_source", None) == result.source:
+            self._loupe.hide()
+            return
+        self._loupe._current_source = result.source
+        self._loupe.show_for(result)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.table.clearSelection()
+            self.selection_detail.setText("Privacy shield active • Press Space on any row to inspect")
+            if self._loupe:
+                self._loupe.hide()
+            return
+        elif event.key() == Qt.Key.Key_Space:
+            self._toggle_stealth_loupe()
+            return
+        super().keyPressEvent(event)
 
     def _open_run(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open a saved run", str(DATA_DIR / "runs"), "Saved run (*.json)")
@@ -1050,7 +1198,6 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Could not save preferences: {exc}")
 
     def closeEvent(self, event):
-        self._startup_audio.stop()
         self._save_settings()
         if self._worker is not None and self._worker.isRunning():
             self._close_requested = True
@@ -1073,5 +1220,4 @@ def launch_ui() -> int:
     app.setFont(QFont("Segoe UI", 10))
     window = create_window()
     window.show()
-    QTimer.singleShot(0, window._startup_audio.play_startup)
     return app.exec()

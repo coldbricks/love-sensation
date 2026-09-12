@@ -13,10 +13,14 @@ class SortOptions:
     destination: str
     threshold: float = 0.62
     mode: str = "top3"  # best, top3, all; unique categories
-    operation: str = "copy"  # copy or move
+    operation: str = "copy"  # copy, move, hardlink
     include_unmatched: bool = True
     selected_classes: list[str] = field(default_factory=list)  # empty = all
     batch_size: int = 16
+    min_prominence: float = 0.0
+    min_aspect_ratio: float = 0.0
+    video_sample_fps: float = 2.0
+    rank_mode: str = "confidence"  # confidence, prominence, aspect, sustained_wow
 
 
 @dataclass
@@ -33,6 +37,18 @@ class ImageResult:
     cached: bool = False
     sha256: str = ""
     output_details: list[dict] = field(default_factory=list)
+    media_type: str = "still"  # still, video, comp, audio
+    duration_s: float = 0.0
+    fps: float = 0.0
+    frame_count: int = 1
+    aspect_ratio: float = 0.0
+    prominence: float = 0.0
+    sustained_wow: float = 0.0
+    best_timestamp_s: float = 0.0
+    best_box: list[int] = field(default_factory=list)
+
+
+MediaResult = ImageResult
 
 
 @dataclass

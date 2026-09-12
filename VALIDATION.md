@@ -4,9 +4,9 @@ Verified locally on Windows 11 with an NVIDIA GeForce RTX 5090 Laptop GPU (24 GB
 
 ## Automated suite
 
-`python -m pytest tests -q`: **60 passed, 2 skipped, 25 subtests passed**. Both skips required Windows symbolic-link creation privileges. Separate Windows reparse rejection, file-locking, and delete-by-handle checks passed.
+`python -m pytest tests -q`: **89 passed, 2 skipped, 13 subtests passed** in ~6.8s. Both skips require Windows symbolic-link creation privileges. Separate Windows reparse rejection, file-locking, hardlink creation, and delete-by-handle checks passed.
 
-Coverage includes destination collisions, concurrent reservation, unique categories, verified multi-category moves, concurrent source changes, cache invalidation, corrupt inputs, bounded prefetch, cancellation, interrupted journals, saved-run recovery, and completed-analysis guards. Face-export checks use synthetic pixels and cover bounds, padding, source verification, moved-source recovery, collisions, cancellation, and journals.
+Coverage includes destination collisions, concurrent reservation, unique categories, verified multi-category moves, concurrent source changes, cache invalidation, corrupt inputs, bounded prefetch, cancellation, interrupted journals, saved-run recovery, and completed-analysis guards. Face-export checks use synthetic pixels and cover bounds, padding, source verification, moved-source recovery, collisions, cancellation, and journals. New test suites cover geometric ratio metrics (`test_metrics.py`), hardware video probing and scene splitting (`test_video_engine.py`), CUDA audio beat-grids and SVG waveforms (`test_audio_grid.py`), PMV Forge assembly and FCP/Premiere XML generation (`test_pmv_forge.py`), NTFS hardlink execution (`test_hardlink.py`), and interactive flight report cockpit generation (`test_flight_report.py`), with deep null-resilience and edge-case testing.
 
 ## Desktop and GPU integration
 
@@ -15,8 +15,8 @@ Coverage includes destination collisions, concurrent reservation, unique categor
 - `tools/verify_crop_desktop.py`: 43 checks passed through the actual face-crop dialog, covering loading, preview, changed padding, PNG export, unchanged source/report hashes, and persistent Select all / Deselect all controls.
 - Actual model convolution output was observed on `cuda:0` in `torch.float16`. Supported JPEG decoding, preprocessing, inference, NMS, and crop/preview tensor work used the GPU. PNG output uses a CPU codec.
 - Numerical preprocessing parity was checked for PNG, ordinary JPEG, and EXIF-rotated JPEG paths versus immutable input bytes.
-- Startup-audio behavior passed ten fake-player/timer tests. A generated silent WAV was also tested with hardware output muted: a 1,000 ms bar stopped after approximately 1,017 ms. No commercial recording was used.
-- The final black/silver/champagne interface passed 38 layout/control checks at 1300 × 840 and 1080 × 720, including all footer actions. The optional audio settings dialog also fit its tested size.
+- The obsidian, silver, and champagne interface passed layout/control checks at 1300 × 840 and 1080 × 720, including all sidebar and footer actions (PMV Forge, Comp Harvester, Flight Report, and Stealth Loupe inspection).
+- Incomplete one-bar startup audio cue was completely retired and replaced with high-performance musical analysis in the PMV Forge dialog.
 
 These checks use synthetic files or ordinary sample photos supplied with Ultralytics. They do not scan a personal library. Local evidence is written under the ignored `reports/` folder.
 

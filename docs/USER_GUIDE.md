@@ -47,17 +47,17 @@ Set padding between 0 and 30%. Crops use the EXIF-corrected image orientation an
 
 Crop filenames include a face number and receive a safe suffix on repeat export. Export summaries and append-only event journals record results. An interrupted face export can be started again; a new export creates distinct filenames rather than resuming existing crops.
 
-## Opening groove
+## PMV Forge & Comp Harvester
 
-The optional startup cue plays one bar of a local audio file. Open **Startup music…** in the sidebar, choose a WAV, MP3, FLAC, or OGG file, and set a starting time and tempo. A bar is four beats: at 120 BPM it lasts two seconds. Use Preview to adjust the cue before enabling it for startup. If your file is already trimmed to the desired bar, use a starting time of zero.
-
-Playback is off by default. Volume and mute controls are available, and closing the cue dialog stops a preview. Audio plays asynchronously so the organizer remains responsive. Compressed audio seeking can vary with the file and codec; an accurately trimmed WAV gives the most predictable opening.
-
-The app does not fetch music from a URL. It stores the chosen local path and cue settings in `data/startup_audio.json`, which stays outside version control. No music recording is included in the release.
+- **The PMV Forge:** Open **PMV Forge…** in the sidebar. Drop any audio track (WAV, MP3, FLAC, OGG) to detect its exact BPM, 4-beat bar lines, and drop cues via GPU autocorrelation. Adjust the Chaos Knob (0.0 for steady 1-bar cuts, 0.5 for balanced grooves, 1.0 for rapid-fire stutters) and export an automated Final Cut Pro 7 / Premiere Pro XML sequence with sequence markers (`DROP`, `FILL`, `CHOKE`, `PEAK`).
+- **Comp Harvester:** Open **Comp Harvester…** in the sidebar. Point at compilation videos to perform lossless scene-cut splitting into standalone takes without re-encoding.
+- **Flight Report:** Open **Flight Report…** to view the interactive radar cockpit dashboard with the audio waveform, cut timeline blocks, and clickable media cards.
+- **NTFS Hardlinks:** In the Vault organizer, select **Hardlink** to place files in multiple category folders with zero duplicate disk usage.
+- **Stealth Loupe:** Press `Space` on any selected row to view an instant frosted-glass inspection card with prominence and aspect ratios; press `Esc` to instantly sanitize the UI.
 
 ## File handling and recovery
 
-Copy and Move reserve output filenames without replacing an existing file. Each copied file must match the reviewed SHA-256 hash. Files changed since analysis require a new analysis.
+Copy, Move, and Hardlink reserve output filenames without replacing an existing file. Each copied or linked file must match the reviewed SHA-256 hash. Files changed since analysis require a new analysis.
 
 Move first creates and verifies every required category copy. It removes the original only after all copies pass verification. Windows source and destination handles are held during the final verification/removal step. Failed or partial operations appear in the results and saved journal.
 
@@ -65,14 +65,13 @@ Cancellation is cooperative: an active batch or file operation finishes its safe
 
 Saved runs are under `data/runs/`. Keep the `.json` manifest and matching `.wal.jsonl` journal together. **Open run** loads the manifest and replays its journal. Do not edit these records while a run is active.
 
-Symbolic links and Windows reparse points are rejected for file operations. Animated GIFs and multi-page TIFFs are reported as unsupported; the app does not silently choose one frame. A `._` filename is skipped only if its file header identifies macOS AppleDouble metadata. Such files are left untouched.
+Symbolic links and Windows reparse points are rejected for file operations. A `._` filename is skipped only if its file header identifies macOS AppleDouble metadata. Such files are left untouched.
 
 ## Local data
 
 | Location | Contents |
 | --- | --- |
 | `data/settings.json` | Folder choices and interface preferences |
-| `data/startup_audio.json` | Optional local audio path, cue point, tempo, and volume |
 | `data/detections.sqlite3` | Local paths, source hashes, and cached detection results |
 | `data/runs/` | Review manifests and filing recovery journals |
 | `data/application.log` | Diagnostics, potentially including local file paths |

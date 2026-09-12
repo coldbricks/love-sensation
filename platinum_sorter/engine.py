@@ -26,11 +26,13 @@ from typing import Callable, Iterator
 from .contracts import Detector, EventSink, ImageResult, ScanReport, SortOptions
 
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff"})
+VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"})
+MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 _CHUNK_SIZE = 1024 * 1024
 # One current and one prefetched group: at most 128 MiB of encoded images.
 # Larger individual files retain the streaming signature/path adapter.
 _SNAPSHOT_BATCH_BYTES = 64 * 1024 * 1024
-_APPLIED = frozenset({"copied", "moved"})
+_APPLIED = frozenset({"copied", "moved", "hardlinked"})
 
 
 class _Cancelled(Exception):
@@ -88,8 +90,8 @@ def _validate_options(options: SortOptions) -> tuple[Path, Path]:
         raise ValueError("Confidence threshold must be between 0 and 1.")
     if options.mode not in {"best", "top3", "all"}:
         raise ValueError("Category mode must be best, top3, or all.")
-    if options.operation not in {"copy", "move"}:
-        raise ValueError("Operation must be copy or move.")
+    if options.operation not in {"copy", "move", "hardlink"}:
+        raise ValueError("Operation must be copy, move, or hardlink.")
     if not isinstance(options.batch_size, int) or not 1 <= options.batch_size <= 256:
         raise ValueError("Batch size must be between 1 and 256.")
     return source, destination
@@ -188,7 +190,7 @@ def _read_snapshot(path: Path, cancel: threading.Event, max_bytes: int) -> tuple
     with _open_regular(path) as file:
         before = os.fstat(file.fileno())
         content = None
-        if before.st_size <= max_bytes:
+        if before.st_size <= max_bytes and path.suffix.lower() not in VIDEO_EXTENSIONS:
             if cancel.is_set():
                 raise _Cancelled("Cancelled while reading file.")
             # Allocate for this file, not the entire 64 MiB group budget.
@@ -325,13 +327,48 @@ def _clean_detections(detections) -> list[dict]:
     return clean
 
 
+def _create_hardlink_win32(source: Path, destination: Path) -> bool:
+    """Attempt Win32 CreateHardLinkW. Returns True if succeeded, False if cross-volume or unsupported."""
+    _assert_no_links(source)
+    _assert_no_links(destination.parent)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_hard_link = kernel32.CreateHardLinkW
+        create_hard_link.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPVOID]
+        create_hard_link.restype = wintypes.BOOL
+        src_str = str(Path(os.path.abspath(source)))
+        dst_str = str(Path(os.path.abspath(destination)))
+        success = create_hard_link(dst_str, src_str, None)
+        return bool(success)
+    else:
+        try:
+            os.link(source, destination)
+            return True
+        except OSError:
+            return False
+
+
 def _select_categories(detections: list[dict], options: SortOptions) -> list[str]:
     allowed = set(options.selected_classes)
     best: dict[str, float] = {}
     for detection in detections:
         label, confidence = detection["class"], detection["score"]
+        prominence = float(detection.get("prominence", confidence))
+        aspect = float(detection.get("aspect", 0.0))
         if confidence >= options.threshold and (not allowed or label in allowed):
-            best[label] = max(confidence, best.get(label, 0.0))
+            if options.min_prominence > 0.0 and prominence < options.min_prominence:
+                continue
+            if options.min_aspect_ratio > 0.0 and aspect < options.min_aspect_ratio:
+                continue
+            if options.rank_mode == "prominence":
+                score_val = prominence
+            elif options.rank_mode == "aspect":
+                score_val = aspect
+            else:
+                score_val = confidence
+            best[label] = max(score_val, best.get(label, 0.0))
     categories = sorted(best, key=lambda label: (-best[label], label))
     if options.mode == "best":
         categories = categories[:1]
@@ -455,7 +492,7 @@ class SorterEngine:
             folders[:] = sorted((name for name in folders if not _is_link(Path(directory) / name)), key=str.casefold)
             for name in sorted(names, key=str.casefold):
                 path = Path(directory) / name
-                if path.suffix.lower() in IMAGE_EXTENSIONS:
+                if path.suffix.lower() in MEDIA_EXTENSIONS:
                     try:
                         if not _is_link(path) and path.is_file():
                             # macOS AppleDouble resource metadata sometimes keeps
@@ -533,11 +570,29 @@ class SorterEngine:
                         result.status, result.error = "error", f"Analysis failed: {type(error).__name__}: {error}"
                     else:
                         try:
-                            result.detections = _clean_detections(raw)
+                            if isinstance(raw, dict):
+                                # Payload from video prominence profile or video cache
+                                dets = raw.get("all_detections") or raw.get("detections") or []
+                                result.detections = _clean_detections(dets)
+                                result.prominence = float(raw.get("peak_prominence", raw.get("prominence", result.prominence)))
+                                result.sustained_wow = float(raw.get("sustained_wow", result.sustained_wow))
+                                result.aspect_ratio = float(raw.get("peak_aspect", raw.get("aspect_ratio", result.aspect_ratio)))
+                                result.best_timestamp_s = float(raw.get("peak_timestamp_s", raw.get("best_timestamp_s", result.best_timestamp_s)))
+                                if raw.get("best_box"):
+                                    result.best_box = [int(round(v)) for v in raw["best_box"]]
+                            else:
+                                result.detections = _clean_detections(raw)
+                                from .metrics import evaluate_frame_detections
+                                eval_res = evaluate_frame_detections(result.detections, 640, 640)
+                                result.prominence = eval_res["max_prominence"]
+                                result.aspect_ratio = eval_res["max_aspect"]
+                                if eval_res["best_detection"] and eval_res["best_detection"].get("box"):
+                                    result.best_box = [int(round(v)) for v in eval_res["best_detection"]["box"]]
                             result.categories = _select_categories(result.detections, options)
                             result.status = "ready" if result.categories else "skipped"
                             if not result.cached:
-                                cache.execute("INSERT OR REPLACE INTO detections VALUES (?,?,?,?,?,?)", (result.source, result.size, result.mtime_ns, self._detector.fingerprint, result.sha256, json.dumps(result.detections)))
+                                payload_to_store = raw if isinstance(raw, dict) else result.detections
+                                cache.execute("INSERT OR REPLACE INTO detections VALUES (?,?,?,?,?,?)", (result.source, result.size, result.mtime_ns, self._detector.fingerprint, result.sha256, json.dumps(payload_to_store)))
                         except Exception as detected_error:
                             result.status, result.error = "error", f"Analysis failed: {type(detected_error).__name__}: {detected_error}"
                     report.results.append(result)
@@ -549,44 +604,90 @@ class SorterEngine:
                         return
                     batch = list(pending)
                     pending.clear()
-                    encoded_indices = [index for index, result in enumerate(batch) if result.source in pending_snapshots]
-                    legacy_indices = [index for index, result in enumerate(batch) if result.source not in pending_snapshots]
-                    detections = [None] * len(batch)
-                    if encoded_indices:
-                        raw_encoded = self._batch(
-                            [Path(batch[index].source) for index in encoded_indices],
-                            [pending_snapshots[batch[index].source] for index in encoded_indices],
-                        )
-                        for index, raw in zip(encoded_indices, raw_encoded):
-                            detections[index] = raw
-                    if legacy_indices:
-                        for index, raw in zip(legacy_indices, self._batch([Path(batch[index].source) for index in legacy_indices])):
-                            detections[index] = raw
-                    for result, raw in zip(batch, detections):
-                        if isinstance(raw, Exception):
-                            finish(result, error=raw)
-                        else:
-                            try:
-                                if cancel.is_set():
-                                    raise _Cancelled("Analysis cancelled before source verification.")
-                                path = Path(result.source)
-                                if result.source in pending_snapshots:
-                                    # Hash and detection came from exactly the same
-                                    # immutable bytes. No second full read is needed.
-                                    # Apply and future cache hits still rehash source.
-                                    _assert_no_links(path)
-                                    current = path.lstat()
-                                    if (current.st_size, current.st_mtime_ns) != (result.size, result.mtime_ns):
+
+                    still_items = [r for r in batch if r.media_type != "video"]
+                    video_items = [r for r in batch if r.media_type == "video"]
+
+                    # 1. Process still images through snapshot and legacy batches
+                    if still_items:
+                        encoded_indices = [index for index, result in enumerate(still_items) if result.source in pending_snapshots]
+                        legacy_indices = [index for index, result in enumerate(still_items) if result.source not in pending_snapshots]
+                        detections = [None] * len(still_items)
+                        if encoded_indices:
+                            raw_encoded = self._batch(
+                                [Path(still_items[index].source) for index in encoded_indices],
+                                [pending_snapshots[still_items[index].source] for index in encoded_indices],
+                            )
+                            for index, raw in zip(encoded_indices, raw_encoded):
+                                detections[index] = raw
+                        if legacy_indices:
+                            for index, raw in zip(legacy_indices, self._batch([Path(still_items[index].source) for index in legacy_indices])):
+                                detections[index] = raw
+                        for result, raw in zip(still_items, detections):
+                            if isinstance(raw, Exception):
+                                finish(result, error=raw)
+                            else:
+                                try:
+                                    if cancel.is_set():
+                                        raise _Cancelled("Analysis cancelled before source verification.")
+                                    path = Path(result.source)
+                                    if result.source in pending_snapshots:
+                                        _assert_no_links(path)
+                                        current = path.lstat()
+                                        if (current.st_size, current.st_mtime_ns) != (result.size, result.mtime_ns):
+                                            raise ValueError("Source changed during analysis.")
+                                    elif _signature(path, cancel) != (result.size, result.mtime_ns, result.sha256):
                                         raise ValueError("Source changed during analysis.")
-                                elif _signature(path, cancel) != (result.size, result.mtime_ns, result.sha256):
-                                    raise ValueError("Source changed during analysis.")
-                                finish(result, raw=raw)
-                            except _Cancelled:
-                                result.status, result.error = "cancelled", "Analysis cancelled before source verification."
-                                report.results.append(result)
-                                _send(emit, type="result", result=result)
-                            except Exception as error:
-                                finish(result, error=error)
+                                    finish(result, raw=raw)
+                                except _Cancelled:
+                                    result.status, result.error = "cancelled", "Analysis cancelled before source verification."
+                                    report.results.append(result)
+                                    _send(emit, type="result", result=result)
+                                except Exception as error:
+                                    finish(result, error=error)
+
+                    # 2. Process video files via frame extraction and GPU temporal scoring
+                    for v_result in video_items:
+                        if cancel.is_set():
+                            v_result.status, v_result.error = "cancelled", "Analysis cancelled."
+                            report.results.append(v_result)
+                            _send(emit, type="result", result=v_result)
+                            continue
+                        try:
+                            v_path = Path(v_result.source)
+                            from .video_engine import sample_video_frames
+                            from .metrics import video_prominence_profile
+                            frames = sample_video_frames(v_path, sample_fps=options.video_sample_fps, max_frames=24)
+                            if not frames:
+                                finish(v_result, raw={"detections": [], "sustained_wow": 0.0, "peak_prominence": 0.0})
+                                continue
+
+                            frame_bytes = [fb for ts, fb in frames]
+                            if callable(getattr(self._detector, "detect_encoded_batch", None)):
+                                raw_dets = self._detector.detect_encoded_batch(frame_bytes)
+                            else:
+                                import tempfile
+                                with tempfile.TemporaryDirectory(prefix="video_frames_") as tmpdir:
+                                    tmp_frames = []
+                                    for fi, fb in enumerate(frame_bytes):
+                                        f_path = Path(tmpdir) / f"frame_{fi:04d}.jpg"
+                                        f_path.write_bytes(fb)
+                                        tmp_frames.append(f_path)
+                                    raw_dets = self._detector.detect_batch(tmp_frames)
+
+                            frame_data = []
+                            for (ts, _), dets in zip(frames, raw_dets):
+                                if isinstance(dets, list):
+                                    frame_data.append((ts, _clean_detections(dets)))
+
+                            prof = video_prominence_profile(
+                                frame_data, 640, 640,
+                                selected_classes=set(options.selected_classes) if options.selected_classes else None,
+                            )
+                            finish(v_result, raw=prof)
+                        except Exception as v_err:
+                            finish(v_result, error=v_err)
+
                     pending_snapshots.clear()
                     cache.commit()
                     report.elapsed_seconds = time.perf_counter() - started
@@ -594,6 +695,16 @@ class SorterEngine:
 
                 def accept_source(path, signature, content=None):
                     result = ImageResult(str(path), str(path.relative_to(source)), 0, 0)
+                    if path.suffix.lower() in VIDEO_EXTENSIONS:
+                        result.media_type = "video"
+                        try:
+                            from .video_engine import probe_media_file
+                            v_info = probe_media_file(path)
+                            result.duration_s = v_info.get("duration_s", 0.0)
+                            result.fps = v_info.get("fps", 0.0)
+                            result.frame_count = v_info.get("frame_count", 1)
+                        except Exception:
+                            pass
                     try:
                         if isinstance(signature, Exception):
                             raise signature
@@ -738,16 +849,28 @@ class SorterEngine:
                     result.output_details.append(current_output)
                     try:
                         self._journal(report, result)
-                        with os.fdopen(descriptor, "wb") as target:
+                        hardlinked = False
+                        if report.options.operation == "hardlink":
+                            os.close(descriptor)
                             descriptor = -1
-                            self._copy_source(source, target, cancel)
-                            target.flush()
-                            os.fsync(target.fileno())
+                            destination.unlink(missing_ok=True)
+                            if _create_hardlink_win32(source, destination):
+                                hardlinked = True
+                            else:
+                                destination, descriptor = _reserve_destination(desired)
+                                current_output["path"] = str(destination)
+                                result.destinations[-1] = str(destination)
+                        if not hardlinked:
+                            with os.fdopen(descriptor, "wb") as target:
+                                descriptor = -1
+                                self._copy_source(source, target, cancel)
+                                target.flush()
+                                os.fsync(target.fileno())
                         size, _, digest = _signature(destination, cancel)
                         if (size, digest) != (result.size, result.sha256):
                             raise ValueError("Copied output failed SHA256 verification.")
                         os.utime(destination, ns=(source.stat().st_atime_ns, result.mtime_ns))
-                        current_output.update(status="verified", sha256=digest)
+                        current_output.update(status="verified", sha256=digest, method="hardlink" if hardlinked else "copy")
                         verified_outputs.append(destination)
                         self._journal(report, result)
                     finally:
@@ -769,6 +892,8 @@ class SorterEngine:
                         self._journal(report, result)
                         _delete_verified_source(source, expected, cancel)
                     result.status = "moved"
+                elif report.options.operation == "hardlink":
+                    result.status = "hardlinked" if all(d.get("method") == "hardlink" for d in result.output_details if d.get("status") == "verified") else "copied"
                 else:
                     # Surface concurrent source changes even though the originals
                     # are safe and each destination matched the analyzed content.
