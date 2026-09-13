@@ -20,12 +20,22 @@ jobs:
         python: ['3.12', '3.14']
     steps:
       - uses: actions/checkout@v6
-      - name: Install Linux Qt Multimedia runtime
+      - name: Install Linux Qt and media runtimes
         if: runner.os == 'Linux'
         # QtMultimedia links audio and graphics libraries even with fake players.
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libpulse0 libegl1 libgl1 libxkbcommon0
+          sudo apt-get install --yes --no-install-recommends libpulse0 libegl1 libgl1 libxkbcommon0 ffmpeg
+      - name: Install Windows media runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install ffmpeg --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'FFmpeg installation failed' }
+      - name: Verify media tools
+        run: |
+          ffmpeg -version
+          ffprobe -version
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
