@@ -46,9 +46,25 @@ class ImageResult:
     sustained_wow: float = 0.0
     best_timestamp_s: float = 0.0
     best_box: list[int] = field(default_factory=list)
+    included: bool = True
+    original_categories: list[str] | None = None
+    width: int = 0
+    height: int = 0
+    sampled_frames: int = 0
+    failed_frames: int = 0
+    sampled_timestamps_s: list[float] = field(default_factory=list)
 
 
 MediaResult = ImageResult
+
+
+class DetectionResult(list):
+    """List-compatible detections with the decoded, EXIF-oriented pixel size."""
+
+    def __init__(self, detections=(), *, width: int, height: int):
+        super().__init__(detections)
+        self.width = width
+        self.height = height
 
 
 @dataclass

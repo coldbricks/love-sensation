@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.1.0 — Library & Review
+
+- Collapsible folder setup, compact statistics and a larger review workspace with an inspector.
+- Multi-select Include/Skip controls, per-file category corrections and saved review decisions. Applying a run uses its full included set, independent of filters.
+- On-demand image/video previews on Space, with CUDA decoding/resizing where supported and no disk thumbnail cache.
+- Escape hides the workspace and owned Qt dialogs; resuming is explicit and previews remain closed. Background jobs keep running safely.
+- Source-sized prominence calculations, versioned raw video caching and explicit incomplete/failed scan states.
+- Restored Forge dialog, reliable worker shutdown, music-grid invalidation, source/song bounds and rational frame-rate handling.
+- Harvester fast/accurate modes, complete long-scene extraction, measured output metadata and separate run output folders.
+- Flight Reports preserve inclusion state and use safe, unique run names and atomic HTML writes.
+
+BeatEdit marker import, a persistent collection catalog and editor round-trip validation remain future work.
+
 ## 2.0.0
 
 - **PMV Forge & Premiere Pro / FCP XML Sequence Exporter**: Musical edit assembly engine with Chaos Knob (0.0–1.0), pre-drop acceleration/retrigger fills, drop downbeat chokes/peaks, breakdown holds, and frame-quantized Final Cut Pro 7 / Premiere Pro XML (`<xmeml version="4">`) export with color-coded sequence markers (`DROP`, `FILL`, `CHOKE`, `PEAK`, `OUTRO`).

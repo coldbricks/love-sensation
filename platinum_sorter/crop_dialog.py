@@ -380,7 +380,8 @@ class FaceCropDialog(QDialog):
             self.device_label.setText("CPU fallback")
 
     def _browse_output(self):
-        path = QFileDialog.getExistingDirectory(self, "Choose face crop output folder", self.destination_edit.text().strip().strip('"'))
+        path = QFileDialog.getExistingDirectory(self, "Choose face crop output folder", self.destination_edit.text().strip().strip('"'),
+                                               options=QFileDialog.Option.DontUseNativeDialog)
         if path:
             self.destination_edit.setText(path)
 

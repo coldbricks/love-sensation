@@ -11,10 +11,47 @@ import html
 import math
 import os
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from fractions import Fraction
 from pathlib import Path
 from typing import Sequence
 from urllib.parse import quote
+from .video_engine import probe_media_file, is_video_path
+
+
+def frame_rate(fps: int | float | str) -> tuple[Fraction, int, str]:
+    """Return the exact rate and xmeml timebase, keeping integer rates distinct."""
+    try:
+        rate = Fraction(str(fps))
+    except (ValueError, ZeroDivisionError):
+        raise ValueError(f"Invalid frame rate: {fps}") from None
+    aliases = {Fraction('23.976'): Fraction(24000, 1001), Fraction('23.98'): Fraction(24000, 1001),
+               Fraction('29.97'): Fraction(30000, 1001), Fraction('59.94'): Fraction(60000, 1001)}
+    rate = aliases.get(rate, rate)
+    if rate <= 0 or rate > 240:
+        raise ValueError(f"Unsupported frame rate: {fps}")
+    if rate.denominator == 1:
+        return rate, rate.numerator, "FALSE"
+    if rate.denominator == 1001 and rate.numerator in {24000, 30000, 60000, 120000}:
+        return rate, rate.numerator // 1000, "TRUE"
+    raise ValueError(f"Unsupported variable or nonstandard frame rate: {fps}; conform the media first")
+
+
+def prepare_candidate_clips(clips: Sequence[dict]) -> list[dict]:
+    """Validate and probe real local candidates; never invent a source duration."""
+    prepared = []
+    for clip in clips:
+        raw = clip.get("path") or clip.get("source")
+        if not raw:
+            raise ValueError("A candidate has no media path")
+        path = Path(raw).resolve()
+        if not path.is_file() or not is_video_path(path):
+            raise ValueError(f"Video file is missing or unsupported: {path.name}")
+        info = probe_media_file(path)
+        if info.get("duration_s", 0) <= 0 or info.get("width", 0) <= 0:
+            raise ValueError(f"Could not probe video: {path.name}")
+        prepared.append({**clip, **info, "path": str(path), "source": str(path), "media_type": "video"})
+    return prepared
 
 
 @dataclass
@@ -43,7 +80,7 @@ def assemble_pmv_timeline(
     Enforces recency penalties so clips don't repeat consecutively, reserves transition handles
     for NLE cross-dissolves, and maps peak visual assets onto musical drops.
     """
-    if not candidate_clips:
+    if not candidate_clips or audio_grid.get("reliable") is False:
         return []
 
     rng = random.Random(seed)
@@ -93,11 +130,18 @@ def assemble_pmv_timeline(
     except (TypeError, ValueError):
         beat_period = 0.5
 
+    if not bars or not math.isfinite(nominal_total) or nominal_total <= 0:
+        return []
+    rate, _, _ = frame_rate(fps)
+    total_duration = math.floor(nominal_total * rate + 1e-8) / float(rate)
+    bars = sorted(set(b for b in bars if 0 <= b < total_duration))
+    beats = sorted(set(b for b in beats if 0 <= b < total_duration))
     if not bars:
         return []
-
-    default_bar_dur = (bars[1] - bars[0]) if len(bars) > 1 else (4.0 * beat_period)
-    total_duration = max(nominal_total, bars[-1] + default_bar_dur)
+    for clip in candidate_clips:
+        duration = float(clip.get("duration_s") or 0)
+        if not math.isfinite(duration) or duration < 1 / float(rate):
+            raise ValueError("Every candidate needs a valid duration of at least one timeline frame")
 
     # Sort candidates by prominence descending for peak moments (safe against None)
     def _score(c: dict) -> float:
@@ -168,10 +212,10 @@ def assemble_pmv_timeline(
             return 0.0, slice_dur, 0.0, 0.0
 
     cuts: list[CutSlice] = []
-    first_beat = beats[0] if beats else 0.0
+    first_beat = bars[0]
 
     # Optional intro pad before first beat
-    if first_beat > 0.05:
+    if first_beat > 0:
         intro_clip = pick_candidate(candidate_clips)
         cin, cout, hin, hout = pick_clip_in_with_handles(intro_clip, first_beat, tag="intro")
         intro_path = str(intro_clip.get("path") or "")
@@ -293,11 +337,28 @@ def assemble_pmv_timeline(
                 handle_out_s=round(hout, 3),
             ))
 
-    # Mark the final slice as outro
-    if cuts:
-        cuts[-1].tag = "outro"
-
-    return cuts
+    # A long requested hold is repeated in source-sized pieces rather than
+    # reading beyond EOF. Recompute handles after fill offsets and splitting.
+    source_durations = {str(c.get("path") or ""): float(c["duration_s"]) for c in candidate_clips}
+    bounded = []
+    cursor_frame = 0
+    total_frames = int(round(total_duration * rate))
+    for cut in cuts:
+        duration = source_durations[cut.clip_path]
+        end_frame = min(total_frames, int(round(cut.timeline_end_s * rate)))
+        available_frames = max(1, math.floor(duration * rate + 1e-8))
+        while cursor_frame < end_frame:
+            frames = min(end_frame - cursor_frame, available_frames)
+            cursor = cursor_frame / float(rate)
+            span = frames / float(rate)
+            cin = min(max(0.0, cut.clip_in_s), max(0.0, duration - span))
+            bounded.append(replace(cut, timeline_start_s=cursor, timeline_end_s=cursor + span,
+                duration_s=span, clip_in_s=cin, clip_out_s=cin + span,
+                handle_in_s=min(.25, cin), handle_out_s=min(.25, max(0.0, duration - cin - span))))
+            cursor_frame += frames
+    if bounded:
+        bounded[-1].tag = "outro"
+    return bounded
 
 
 def xml_media_id(path: Path | str, prefix: str = "file") -> str:
@@ -319,25 +380,26 @@ def export_fcp7_xml(
     audio_path = Path(audio_path)
     output_xml_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Calculate timebase and NTSC flag
-    try:
-        float_fps = float(fps)
-        if not math.isfinite(float_fps) or float_fps <= 0:
-            float_fps = 30.0
-    except (TypeError, ValueError):
-        float_fps = 30.0
-    if abs(float_fps - 23.976) < 0.05 or abs(float_fps - 23.98) < 0.05:
-        timebase = 24
-        ntsc_str = "TRUE"
-    elif abs(float_fps - 29.97) < 0.05:
-        timebase = 30
-        ntsc_str = "TRUE"
-    elif abs(float_fps - 59.94) < 0.05:
-        timebase = 60
-        ntsc_str = "TRUE"
-    else:
-        timebase = int(round(float_fps))
-        ntsc_str = "FALSE"
+    rate, timebase, ntsc_str = frame_rate(fps)
+    float_fps = float(rate)
+    if not cuts:
+        raise ValueError("No timeline cuts to export")
+    if not audio_path.is_file():
+        raise ValueError("The analyzed soundtrack is missing")
+    audio_info = probe_media_file(audio_path)
+    if not audio_info.get("has_audio") or audio_info.get("duration_s", 0) <= 0:
+        raise ValueError("The soundtrack has no readable audio stream")
+    metadata = {}
+    for cut in cuts:
+        if cut.clip_path not in metadata:
+            metadata[cut.clip_path] = prepare_candidate_clips([{"path": cut.clip_path}])[0]
+        info = metadata[cut.clip_path]
+        if not all(math.isfinite(v) for v in (cut.clip_in_s, cut.clip_out_s, cut.timeline_start_s, cut.timeline_end_s)):
+            raise ValueError("Non-finite cut timing")
+        if cut.clip_in_s < 0 or cut.clip_out_s > info["duration_s"] + 1e-6 or cut.clip_out_s <= cut.clip_in_s:
+            raise ValueError(f"Cut extends outside source: {cut.clip_name}")
+    if cuts[-1].timeline_end_s > audio_info["duration_s"] + 1e-6:
+        raise ValueError("Timeline extends beyond the soundtrack")
 
     def to_pathurl(p: Path | str) -> str:
         resolved = str(Path(p).resolve()).replace("\\", "/")
@@ -349,7 +411,11 @@ def export_fcp7_xml(
     for cut in cuts:
         start_f = curr_frame
         target_end_f = int(round(cut.timeline_end_s * float_fps))
-        end_f = max(start_f + 1, target_end_f)
+        end_f = target_end_f
+        if end_f <= start_f:
+            raise ValueError("A timeline cut is shorter than one frame")
+        if abs(cut.timeline_start_s * float_fps - start_f) > 1.01:
+            raise ValueError("Timeline contains a gap or overlap")
         dur_f = end_f - start_f
         curr_frame = end_f
         timeline_frame_spans.append((start_f, end_f, dur_f))
@@ -380,14 +446,20 @@ def export_fcp7_xml(
     seen_files: set[str] = set()
     for idx, cut in enumerate(cuts):
         clip_path = Path(cut.clip_path)
+        info = metadata[cut.clip_path]
+        source_rate, source_timebase, source_ntsc = frame_rate(info.get("fps_ratio") or info["fps"])
+        source_fps = float(source_rate)
         start_frame, end_frame, dur_frames = timeline_frame_spans[idx]
-        in_frame = int(round(cut.clip_in_s * float_fps))
-        out_frame = in_frame + dur_frames
-        file_dur = max(out_frame + int(round(cut.handle_out_s * float_fps)), dur_frames + 30)
+        file_dur = int(info.get("frame_count") or round(info["duration_s"] * source_fps))
+        source_span = max(1, int(round((end_frame - start_frame) / float_fps * source_fps)))
+        in_frame = min(int(round(cut.clip_in_s * source_fps)), max(0, file_dur - source_span))
+        out_frame = in_frame + source_span
+        if out_frame > file_dur:
+            raise ValueError(f"Quantized cut exceeds source: {cut.clip_name}")
         fid = xml_media_id(clip_path)
 
         # Cross Dissolve transition on breakdown entrances
-        if cut.tag == "breakdown" and idx > 0:
+        if cut.tag == "breakdown" and idx > 0 and cut.handle_in_s >= .25 and cuts[idx - 1].handle_out_s >= .25:
             trans_dur = min(int(round(0.5 * float_fps)), dur_frames // 2, 16)
             if trans_dur >= 4:
                 t_start = max(0, start_frame - (trans_dur // 2))
@@ -419,10 +491,10 @@ def export_fcp7_xml(
                 f'            <file id="{fid}">',
                 f'              <name>{html.escape(cut.clip_name)}</name>',
                 f'              <pathurl>{to_pathurl(clip_path)}</pathurl>',
-                f'              <rate><timebase>{timebase}</timebase><ntsc>{ntsc_str}</ntsc></rate>',
+                f'              <rate><timebase>{source_timebase}</timebase><ntsc>{source_ntsc}</ntsc></rate>',
                 f'              <duration>{file_dur}</duration>',
                 '              <media><video><samplecharacteristics>',
-                f'                <width>{width}</width><height>{height}</height>',
+                f'                <width>{info["width"]}</width><height>{info["height"]}</height>',
                 '              </samplecharacteristics></video></media>',
                 '            </file>',
             ]
@@ -431,9 +503,9 @@ def export_fcp7_xml(
 
         xml_lines.extend([
             f'          <clipitem id="ci-{idx}">',
-            f'            <name>{html.escape(cut.clip_name)} [{cut.tag.upper()}]</name>',
-            f'            <duration>{dur_frames}</duration>',
-            f'            <rate><timebase>{timebase}</timebase><ntsc>{ntsc_str}</ntsc></rate>',
+            f'            <name>{html.escape(cut.clip_name)} [{html.escape(cut.tag.upper())}]</name>',
+            f'            <duration>{file_dur}</duration>',
+            f'            <rate><timebase>{source_timebase}</timebase><ntsc>{source_ntsc}</ntsc></rate>',
             f'            <start>{start_frame}</start>',
             f'            <end>{end_frame}</end>',
             f'            <in>{in_frame}</in>',
@@ -446,40 +518,41 @@ def export_fcp7_xml(
         '        </track>',
         '      </video>',
         '      <audio>',
-        '        <track>',
-        '          <clipitem id="song-item-1">',
-        f'            <name>{html.escape(audio_path.name)} [L]</name>',
-        f'            <duration>{total_frames}</duration>',
-        f'            <rate><timebase>{timebase}</timebase><ntsc>{ntsc_str}</ntsc></rate>',
-        '            <start>0</start>',
-        f'            <end>{total_frames}</end>',
-        '            <in>0</in>',
-        f'            <out>{total_frames}</out>',
-        '            <file id="song-file">',
-        f'              <name>{html.escape(audio_path.name)}</name>',
-        f'              <pathurl>{to_pathurl(audio_path)}</pathurl>',
-        f'              <rate><timebase>{timebase}</timebase><ntsc>{ntsc_str}</ntsc></rate>',
-        f'              <duration>{total_frames}</duration>',
-        '              <media><audio><samplecharacteristics>',
-        '                <depth>16</depth><samplerate>48000</samplerate><nbchannels>2</nbchannels>',
-        '              </samplecharacteristics></audio></media>',
-        '            </file>',
-        '            <sourcetrack><mediatype>audio</mediatype><trackindex>1</trackindex></sourcetrack>',
-        '          </clipitem>',
-        '        </track>',
-        '        <track>',
-        '          <clipitem id="song-item-2">',
-        f'            <name>{html.escape(audio_path.name)} [R]</name>',
-        f'            <duration>{total_frames}</duration>',
-        f'            <rate><timebase>{timebase}</timebase><ntsc>{ntsc_str}</ntsc></rate>',
-        '            <start>0</start>',
-        f'            <end>{total_frames}</end>',
-        '            <in>0</in>',
-        f'            <out>{total_frames}</out>',
-        '            <file id="song-file"/>',
-        '            <sourcetrack><mediatype>audio</mediatype><trackindex>2</trackindex></sourcetrack>',
-        '          </clipitem>',
-        '        </track>',
+    ])
+    channels = int(audio_info.get("audio_channels", 0))
+    sample_rate = int(audio_info.get("audio_sample_rate", 0))
+    if channels < 1 or sample_rate < 1:
+        raise ValueError("Soundtrack channel count or sample rate is unavailable")
+    for channel in range(1, channels + 1):
+        label = ("L" if channel == 1 else "R") if channels == 2 else f"CH {channel}"
+        xml_lines.extend([
+            '        <track>',
+            f'          <clipitem id="song-item-{channel}">',
+            f'            <name>{html.escape(audio_path.name)} [{label}]</name>',
+            f'            <duration>{total_frames}</duration>',
+            f'            <rate><timebase>{timebase}</timebase><ntsc>{ntsc_str}</ntsc></rate>',
+            '            <start>0</start>', f'            <end>{total_frames}</end>',
+            '            <in>0</in>', f'            <out>{total_frames}</out>',
+        ])
+        if channel == 1:
+            xml_lines.extend([
+                '            <file id="song-file">',
+                f'              <name>{html.escape(audio_path.name)}</name>',
+                f'              <pathurl>{to_pathurl(audio_path)}</pathurl>',
+                f'              <rate><timebase>{timebase}</timebase><ntsc>{ntsc_str}</ntsc></rate>',
+                f'              <duration>{int(audio_info["duration_s"] * float_fps)}</duration>',
+                '              <media><audio><samplecharacteristics>',
+                f'                <samplerate>{sample_rate}</samplerate><nbchannels>{channels}</nbchannels>',
+                '              </samplecharacteristics></audio></media>',
+                '            </file>',
+            ])
+        else:
+            xml_lines.append('            <file id="song-file"/>')
+        xml_lines.extend([
+            f'            <sourcetrack><mediatype>audio</mediatype><trackindex>{channel}</trackindex></sourcetrack>',
+            '          </clipitem>', '        </track>',
+        ])
+    xml_lines.extend([
         '      </audio>',
         '    </media>',
     ])

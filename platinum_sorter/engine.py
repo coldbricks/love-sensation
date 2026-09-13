@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -33,6 +34,8 @@ _CHUNK_SIZE = 1024 * 1024
 # Larger individual files retain the streaming signature/path adapter.
 _SNAPSHOT_BATCH_BYTES = 64 * 1024 * 1024
 _APPLIED = frozenset({"copied", "moved", "hardlinked"})
+_ANALYSIS_CACHE_VERSION = "raw-dimensions-v2"
+_VIDEO_MAX_FRAMES = 24
 
 
 class _Cancelled(Exception):
@@ -94,6 +97,14 @@ def _validate_options(options: SortOptions) -> tuple[Path, Path]:
         raise ValueError("Operation must be copy, move, or hardlink.")
     if not isinstance(options.batch_size, int) or not 1 <= options.batch_size <= 256:
         raise ValueError("Batch size must be between 1 and 256.")
+    for name in ("min_prominence", "min_aspect_ratio"):
+        value = getattr(options, name)
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be a finite nonnegative number.")
+    if not isinstance(options.video_sample_fps, (int, float)) or not math.isfinite(options.video_sample_fps) or not 0 < options.video_sample_fps <= 60:
+        raise ValueError("Video sample rate must be greater than zero and at most 60.")
+    if options.rank_mode not in {"confidence", "prominence", "aspect", "sustained_wow"}:
+        raise ValueError("Unknown category ranking mode.")
     return source, destination
 
 
@@ -323,8 +334,109 @@ def _clean_detections(detections) -> list[dict]:
         box = [float(number) for number in item.get("box", [])]
         if box and (len(box) != 4 or not all(math.isfinite(number) for number in box)):
             raise ValueError("Detector returned an invalid bounding box.")
-        clean.append({"class": item["class"], "score": score, "box": box})
+        record = {"class": item["class"], "score": score, "box": box}
+        for key in ("prominence", "aspect"):
+            if key in item:
+                value = float(item[key])
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(f"Detector returned an invalid {key}.")
+                record[key] = value
+        clean.append(record)
     return clean
+
+
+def _decoded_dimensions(raw, path: Path | None = None, encoded: bytes | None = None) -> tuple[int, int]:
+    """Prefer detector metadata; header-only fallback supports legacy adapters."""
+    width, height = getattr(raw, "width", 0), getattr(raw, "height", 0)
+    if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+        return width, height
+    if encoded is None and path is None:
+        return 0, 0
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(encoded) if encoded is not None else path) as image:
+            width, height = image.size
+            if image.getexif().get(274, 1) in {5, 6, 7, 8}:
+                width, height = height, width
+            return width, height
+    except (OSError, ValueError, TypeError):
+        # Synthetic and third-party adapters can provide classifications without
+        # decodable image bytes. Keep unknown size explicit, never assume 640.
+        return 0, 0
+
+
+def _image_payload(raw, path: Path | None = None, encoded: bytes | None = None) -> dict:
+    width, height = _decoded_dimensions(raw, path, encoded)
+    return {"schema": 2, "kind": "image", "width": width, "height": height,
+            "detections": _clean_detections(raw)}
+
+
+def _validate_payload(payload: dict, media_type: str) -> None:
+    if not isinstance(payload, dict) or payload.get("schema") != 2:
+        raise ValueError("Detection cache schema differs from this engine.")
+    expected = "video" if media_type == "video" else "image"
+    if payload.get("kind") != expected:
+        raise ValueError("Detection cache media type does not match the source.")
+    frames = payload.get("frames") if expected == "video" else [payload]
+    if not isinstance(frames, list) or not frames:
+        raise ValueError("Video analysis returned no usable frames.")
+    for frame in frames:
+        if not isinstance(frame, dict):
+            raise ValueError("Invalid detection frame.")
+        for key in ("width", "height"):
+            if type(frame.get(key)) is not int or frame[key] < 0:
+                raise ValueError("Invalid decoded frame dimensions.")
+        _clean_detections(frame.get("detections"))
+        if expected == "video":
+            ts = frame.get("timestamp_s")
+            if not isinstance(ts, (int, float)) or not math.isfinite(ts) or ts < 0:
+                raise ValueError("Invalid sampled frame timestamp.")
+
+
+def _apply_payload(result: ImageResult, payload: dict, options: SortOptions) -> None:
+    """Recompute review metrics from raw, settings-independent cached frames."""
+    from .metrics import evaluate_frame_detections, sustained_85th_percentile
+    _validate_payload(payload, result.media_type)
+    frames = payload["frames"] if result.media_type == "video" else [payload]
+    allowed = set(options.selected_classes)
+    result.detections = []
+    scores = []
+    peak = -1.0
+    result.prominence = result.aspect_ratio = result.sustained_wow = 0.0
+    result.best_box = []
+    result.best_timestamp_s = 0.0
+    result.width, result.height = frames[0]["width"], frames[0]["height"]
+    for frame in frames:
+        detections = _clean_detections(frame["detections"])
+        # Enrich every record for category filters, then summarize only the
+        # currently selected classes above the user's confidence threshold.
+        evaluate_frame_detections(detections, frame["width"], frame["height"])
+        selected = [d for d in detections if d["score"] >= options.threshold and
+                    (not allowed or d["class"] in allowed) and
+                    d.get("prominence", d["score"]) >= options.min_prominence and
+                    d.get("aspect", 0.0) >= options.min_aspect_ratio]
+        summary = evaluate_frame_detections(selected, frame["width"], frame["height"])
+        scores.append(summary["max_prominence"])
+        if summary["max_prominence"] > peak:
+            peak = summary["max_prominence"]
+            result.prominence = peak
+            result.aspect_ratio = summary["max_aspect"]
+            result.best_timestamp_s = float(frame.get("timestamp_s", 0.0))
+            best = summary["best_detection"]
+            result.best_box = [int(round(v)) for v in best["box"]] if best else []
+        result.detections.extend(detections)
+    result.categories = _select_categories(result.detections, options)
+    if result.media_type == "video":
+        result.sampled_frames = len(frames)
+        result.failed_frames = len(payload.get("failures", []))
+        result.sampled_timestamps_s = [float(frame["timestamp_s"]) for frame in frames]
+        result.sustained_wow = round(sustained_85th_percentile(scores), 4)
+    if result.failed_frames:
+        result.status = "partial"
+        result.error = f"{result.failed_frames} sampled frame(s) could not be analyzed; reanalyze before filing."
+    else:
+        result.status = "ready" if result.categories else "skipped"
+        result.error = ""
 
 
 def _create_hardlink_win32(source: Path, destination: Path) -> bool:
@@ -528,6 +640,21 @@ class SorterEngine:
         with self._run_lock:
             return self._analyze(options, emit, cancel)
 
+    def save_review(self, report: ScanReport) -> None:
+        """Persist review choices without resetting the durable journal sequence."""
+        with self._run_lock:
+            if any(type(result.included) is not bool for result in report.results):
+                raise ValueError("Review inclusion must be true or false.")
+            self._journal(report)
+
+    def _cache_fingerprint(self, options: SortOptions, media_type: str) -> str:
+        assert self._detector is not None
+        fingerprint = f"{self._detector.fingerprint}:{_ANALYSIS_CACHE_VERSION}"
+        if media_type == "video":
+            from .video_engine import VIDEO_SAMPLER_VERSION
+            fingerprint += f":{VIDEO_SAMPLER_VERSION}:fps={options.video_sample_fps:.12g}:frames={_VIDEO_MAX_FRAMES}"
+        return fingerprint
+
     def _analyze(self, options: SortOptions, emit: EventSink, cancel: threading.Event) -> ScanReport:
         source, _ = _validate_options(options)
         started = time.perf_counter()
@@ -568,33 +695,17 @@ class SorterEngine:
                 def finish(result: ImageResult, raw=None, error: Exception | None = None) -> None:
                     if error is not None:
                         result.status, result.error = "error", f"Analysis failed: {type(error).__name__}: {error}"
+                        result.categories = []
                     else:
                         try:
-                            if isinstance(raw, dict):
-                                # Payload from video prominence profile or video cache
-                                dets = raw.get("all_detections") or raw.get("detections") or []
-                                result.detections = _clean_detections(dets)
-                                result.prominence = float(raw.get("peak_prominence", raw.get("prominence", result.prominence)))
-                                result.sustained_wow = float(raw.get("sustained_wow", result.sustained_wow))
-                                result.aspect_ratio = float(raw.get("peak_aspect", raw.get("aspect_ratio", result.aspect_ratio)))
-                                result.best_timestamp_s = float(raw.get("peak_timestamp_s", raw.get("best_timestamp_s", result.best_timestamp_s)))
-                                if raw.get("best_box"):
-                                    result.best_box = [int(round(v)) for v in raw["best_box"]]
-                            else:
-                                result.detections = _clean_detections(raw)
-                                from .metrics import evaluate_frame_detections
-                                eval_res = evaluate_frame_detections(result.detections, 640, 640)
-                                result.prominence = eval_res["max_prominence"]
-                                result.aspect_ratio = eval_res["max_aspect"]
-                                if eval_res["best_detection"] and eval_res["best_detection"].get("box"):
-                                    result.best_box = [int(round(v)) for v in eval_res["best_detection"]["box"]]
-                            result.categories = _select_categories(result.detections, options)
-                            result.status = "ready" if result.categories else "skipped"
-                            if not result.cached:
-                                payload_to_store = raw if isinstance(raw, dict) else result.detections
-                                cache.execute("INSERT OR REPLACE INTO detections VALUES (?,?,?,?,?,?)", (result.source, result.size, result.mtime_ns, self._detector.fingerprint, result.sha256, json.dumps(payload_to_store)))
+                            payload = raw if isinstance(raw, dict) else _image_payload(
+                                raw, Path(result.source), pending_snapshots.get(result.source))
+                            _apply_payload(result, payload, options)
+                            if not result.cached and result.status != "partial":
+                                cache.execute("INSERT OR REPLACE INTO detections VALUES (?,?,?,?,?,?)", (result.source, result.size, result.mtime_ns, self._cache_fingerprint(options, result.media_type), result.sha256, json.dumps(payload)))
                         except Exception as detected_error:
                             result.status, result.error = "error", f"Analysis failed: {type(detected_error).__name__}: {detected_error}"
+                            result.categories = []
                     report.results.append(result)
                     _send(emit, type="result", result=result)
                     _send(emit, type="progress", completed=len(report.results), total=len(paths), phase="analyze")
@@ -656,11 +767,12 @@ class SorterEngine:
                         try:
                             v_path = Path(v_result.source)
                             from .video_engine import sample_video_frames
-                            from .metrics import video_prominence_profile
-                            frames = sample_video_frames(v_path, sample_fps=options.video_sample_fps, max_frames=24)
+                            frames = sample_video_frames(v_path, sample_fps=options.video_sample_fps,
+                                                         max_frames=_VIDEO_MAX_FRAMES, cancel_event=cancel)
+                            if cancel.is_set():
+                                raise _Cancelled("Cancelled during video sampling.")
                             if not frames:
-                                finish(v_result, raw={"detections": [], "sustained_wow": 0.0, "peak_prominence": 0.0})
-                                continue
+                                raise ValueError("No video frames could be decoded; classification is unknown.")
 
                             frame_bytes = [fb for ts, fb in frames]
                             if callable(getattr(self._detector, "detect_encoded_batch", None)):
@@ -675,16 +787,31 @@ class SorterEngine:
                                         tmp_frames.append(f_path)
                                     raw_dets = self._detector.detect_batch(tmp_frames)
 
-                            frame_data = []
-                            for (ts, _), dets in zip(frames, raw_dets):
-                                if isinstance(dets, list):
-                                    frame_data.append((ts, _clean_detections(dets)))
-
-                            prof = video_prominence_profile(
-                                frame_data, 640, 640,
-                                selected_classes=set(options.selected_classes) if options.selected_classes else None,
-                            )
-                            finish(v_result, raw=prof)
+                            if len(raw_dets) != len(frames):
+                                raise ValueError("Detector returned a different number of video frame results.")
+                            frame_data, failures = [], []
+                            for (ts, encoded), dets in zip(frames, raw_dets):
+                                try:
+                                    if isinstance(dets, Exception):
+                                        raise dets
+                                    payload = _image_payload(dets, encoded=encoded)
+                                    frame_data.append({"timestamp_s": ts, "width": payload["width"],
+                                                       "height": payload["height"], "detections": payload["detections"]})
+                                except Exception as frame_error:
+                                    failures.append({"timestamp_s": ts, "error": f"{type(frame_error).__name__}: {frame_error}"})
+                            v_result.failed_frames = len(failures)
+                            if not frame_data:
+                                raise ValueError(f"All {len(frames)} sampled video frames failed analysis.")
+                            if _signature(v_path, cancel) != (v_result.size, v_result.mtime_ns, v_result.sha256):
+                                raise ValueError("Video source changed during analysis.")
+                            finish(v_result, raw={"schema": 2, "kind": "video", "frames": frame_data,
+                                                  "failures": failures})
+                        except (_Cancelled, InterruptedError):
+                            cancel.set()
+                            v_result.status, v_result.error = "cancelled", "Video analysis cancelled."
+                            v_result.categories = []
+                            report.results.append(v_result)
+                            _send(emit, type="result", result=v_result)
                         except Exception as v_err:
                             finish(v_result, error=v_err)
 
@@ -703,18 +830,21 @@ class SorterEngine:
                             result.duration_s = v_info.get("duration_s", 0.0)
                             result.fps = v_info.get("fps", 0.0)
                             result.frame_count = v_info.get("frame_count", 1)
+                            result.width = v_info.get("width", 0)
+                            result.height = v_info.get("height", 0)
                         except Exception:
                             pass
                     try:
                         if isinstance(signature, Exception):
                             raise signature
                         result.size, result.mtime_ns, result.sha256 = signature
-                        row = cache.execute("SELECT sha256,payload FROM detections WHERE path=? AND size=? AND mtime_ns=? AND fingerprint=?", (str(path), result.size, result.mtime_ns, self._detector.fingerprint)).fetchone()
+                        row = cache.execute("SELECT sha256,payload FROM detections WHERE path=? AND size=? AND mtime_ns=? AND fingerprint=?", (str(path), result.size, result.mtime_ns, self._cache_fingerprint(options, result.media_type))).fetchone()
                         if row is not None and row[0] == result.sha256:
                             result.cached = True
                             try:
                                 payload = json.loads(row[1])
-                            except (TypeError, ValueError):
+                                _validate_payload(payload, result.media_type)
+                            except (KeyError, TypeError, ValueError):
                                 result.cached = False
                                 pending.append(result)
                             else:
@@ -790,7 +920,7 @@ class SorterEngine:
             if cancel.is_set():
                 report.cancelled = True
                 break
-            if result.status in _APPLIED or not result.categories or not result.sha256:
+            if not result.included or result.status == "partial" or result.status in _APPLIED or not result.categories or not result.sha256:
                 _send(emit, type="progress", completed=index + 1, total=total, phase="apply")
                 continue
             current_output: dict | None = None

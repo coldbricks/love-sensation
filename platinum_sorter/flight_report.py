@@ -1,15 +1,15 @@
 """Interactive HTML Flight Report and radar scope cockpit generator.
 
-Generates a standalone, zero-external-dependency HTML dashboard with embedded SVGs,
-waveform radar scopes, category distribution bars, and clickable media contact sheets.
+Generates a standalone HTML dashboard with embedded SVGs, category filters,
+and a metadata catalog. Private media files are not embedded or linked.
 """
 from __future__ import annotations
 
-import base64
 import html
-import json
+import math
+import os
+import tempfile
 from pathlib import Path
-from typing import Sequence
 
 TAG_COLORS = {
     "peak": "#e8c58a",      # Champagne gold
@@ -37,6 +37,67 @@ MOON_SPOON_SVG = """<svg width="42" height="42" viewBox="0 0 100 100" fill="none
 </svg>"""
 
 
+def _number(value, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+        return max(0.0, number) if math.isfinite(number) else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _categories(result: dict) -> list[str]:
+    value = result.get("categories") or []
+    if isinstance(value, str):
+        value = [value]
+    return list(dict.fromkeys(str(item).strip() for item in value
+                             if item is not None and str(item).strip()))
+
+
+def _media_name(result: dict) -> str:
+    source = result.get("source") or result.get("path")
+    # Reports may be opened on a platform other than the one that made them.
+    return str(source).replace("\\", "/").rsplit("/", 1)[-1] if source else "unnamed"
+
+
+def _media_type(result: dict) -> str:
+    explicit = str(result.get("media_type") or "").lower()
+    if explicit:
+        return explicit
+    suffix = Path(_media_name(result)).suffix.lower()
+    return "video" if suffix in {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"} else "still"
+
+
+def _waveform_points(value: str | None) -> str:
+    """Accept coordinates, never SVG markup or arbitrary attribute content."""
+    points = []
+    for pair in str(value or "").split():
+        coordinates = pair.split(",")
+        if len(coordinates) != 2:
+            return ""
+        try:
+            x, y = (float(coordinate) for coordinate in coordinates)
+        except (ValueError, OverflowError):
+            return ""
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return ""
+        points.append(f"{x:g},{y:g}")
+    return " ".join(points)
+
+
+def _write_report(path: Path, content: str) -> None:
+    """A failed export must leave the previous report intact."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 def generate_flight_report(
     report_title: str,
     output_path: Path | str,
@@ -47,20 +108,17 @@ def generate_flight_report(
 ) -> Path:
     """Generate a standalone flight_report.html dashboard."""
     output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Calculate statistics
     total_items = len(results)
-    stills = sum(1 for r in results if r.get("media_type") != "video")
-    videos = sum(1 for r in results if r.get("media_type") == "video")
+    included_items = sum(1 for result in results if result.get("included", True))
+    skipped_items = total_items - included_items
+    stills = sum(1 for r in results if _media_type(r) == "still")
+    videos = sum(1 for r in results if _media_type(r) in {"video", "comp"})
     category_counts: dict[str, int] = {}
     for r in results:
-        cats = r.get("categories") or []
-        for cat in cats:
-            if cat is not None:
-                cat_str = str(cat).strip()
-                if cat_str:
-                    category_counts[cat_str] = category_counts.get(cat_str, 0) + 1
+        for cat in _categories(r):
+            category_counts[cat] = category_counts.get(cat, 0) + 1
 
     sorted_categories = sorted(category_counts.items(), key=lambda x: -x[1])
     max_cat_count = max(category_counts.values()) if category_counts else 1
@@ -68,22 +126,12 @@ def generate_flight_report(
     # Audio timeline lanes if PMV
     timeline_html = ""
     if audio_grid and cuts:
-        try:
-            total_dur = float(audio_grid.get("total_duration_s") or 1.0)
-        except (TypeError, ValueError):
-            total_dur = 1.0
-        total_dur = max(total_dur, 1.0)
+        total_dur = max(_number(audio_grid.get("total_duration_s"), 1.0), 1.0)
         raw_bars = audio_grid.get("bars") or []
         cut_blocks = []
         for c in cuts:
-            try:
-                t0 = float(c.get("timeline_start_s") or 0.0)
-            except (TypeError, ValueError):
-                t0 = 0.0
-            try:
-                t1 = float(c.get("timeline_end_s") or 0.0)
-            except (TypeError, ValueError):
-                t1 = 0.0
+            t0 = _number(c.get("timeline_start_s"))
+            t1 = _number(c.get("timeline_end_s"))
             left = max(0.0, min(100.0, (t0 / total_dur) * 100.0))
             width = max(0.4, min(100.0, ((t1 - t0) / total_dur) * 100.0))
             tag = str(c.get("tag") or "normal")
@@ -91,15 +139,11 @@ def generate_flight_report(
             name = html.escape(str(c.get("clip_name") or "clip"))
             cut_blocks.append(
                 f'<div class="cut-block" style="left:{left:.2f}%; width:{width:.2f}%; background:{color};" '
-                f'title="{name} ({tag}) [{t0:.2f}s - {t1:.2f}s]"></div>'
+                f'title="{name} ({html.escape(tag)}) [{t0:.2f}s - {t1:.2f}s]"></div>'
             )
 
-        waveform_polygon = waveform_svg or ""
-        bpm_val = audio_grid.get("bpm")
-        try:
-            bpm_str = f"{float(bpm_val):.1f} BPM" if bpm_val is not None else "0.0 BPM"
-        except (TypeError, ValueError):
-            bpm_str = "0.0 BPM"
+        waveform_polygon = _waveform_points(waveform_svg)
+        bpm_str = f"{_number(audio_grid.get('bpm')):.1f} BPM"
         drops_count = len(audio_grid.get("drop_bars") or [])
         timeline_html = f"""
         <div class="radar-card">
@@ -141,7 +185,7 @@ def generate_flight_report(
         pct = (count / max_cat_count) * 100.0
         escaped_cat = html.escape(cat)
         cat_bars_html.append(f"""
-        <div class="cat-row" onclick="filterByCategory('{escaped_cat}')" title="Click to filter by {escaped_cat}">
+        <div class="cat-row" data-category="{escaped_cat}" role="button" tabindex="0" title="Click to filter by {escaped_cat}">
             <span class="cat-label">{escaped_cat}</span>
             <div class="cat-bar-bg">
                 <div class="cat-bar-fill" style="width:{pct:.1f}%;"></div>
@@ -153,47 +197,32 @@ def generate_flight_report(
     # Media items grid (top items by prominence)
     def _score(r: dict) -> float:
         for k in ("prominence", "aspect_ratio", "sustained_wow"):
-            val = r.get(k)
-            if val is not None:
-                try:
-                    f = float(val)
-                    if f > 0.0:
-                        return f
-                except (TypeError, ValueError):
-                    pass
+            value = _number(r.get(k))
+            if value > 0:
+                return value
         return 0.0
 
     ranked_results = sorted(results, key=_score, reverse=True)
     items_html = []
     for r in ranked_results[:64]:
-        src = r.get("source")
-        name = html.escape(Path(str(src)).name if src else "unnamed")
-        m_type = html.escape(str(r.get("media_type") or "still").upper())
-        try:
-            prom = float(r.get("prominence") or 0.0)
-        except (TypeError, ValueError):
-            prom = 0.0
-        try:
-            sustained = float(r.get("sustained_wow") or 0.0)
-        except (TypeError, ValueError):
-            sustained = 0.0
-        try:
-            dur_val = float(r.get("duration_s") or 0.0)
-        except (TypeError, ValueError):
-            dur_val = 0.0
-        raw_cats = r.get("categories") or []
-        cat_list = [str(c) for c in raw_cats if c is not None]
-        cats = ", ".join(cat_list) or "None"
+        name = html.escape(_media_name(r))
+        m_type = html.escape(_media_type(r).upper())
+        prom = _number(r.get("prominence"))
+        sustained = _number(r.get("sustained_wow"))
+        dur_val = _number(r.get("duration_s"))
+        cats = ", ".join(_categories(r)) or "None"
+        review_state = "Included" if r.get("included", True) else "Skipped"
         dur_str = f"{dur_val:.1f}s • " if dur_val > 0.0 else ""
         wow_lbl = f"{prom:.2f} PEAK / {sustained:.2f} SUSTAINED" if sustained > 0 else f"{prom:.2f} WOW"
         items_html.append(f"""
-        <div class="media-card" data-name="{name.lower()}" data-cats="{cats.lower()}" data-type="{m_type.lower()}">
+        <div class="media-card" data-name="{name.lower()}" data-cats="{html.escape(cats.lower())}" data-type="{m_type.lower()}" data-review-state="{review_state.lower()}">
             <div class="card-top">
                 <span class="type-pill">{dur_str}{m_type}</span>
                 <span class="prom-score">{wow_lbl}</span>
             </div>
             <div class="file-name" title="{name}">{name}</div>
             <div class="card-cats">{html.escape(cats)}</div>
+            <div class="review-state">{review_state} in this review</div>
         </div>
         """)
 
@@ -482,6 +511,11 @@ def generate_flight_report(
     font-size: 11px;
     color: #aaa6aa;
   }}
+  .review-state {{
+    margin-top: 8px;
+    color: #c5b18f;
+    font-size: 11px;
+  }}
 </style>
 </head>
 <body>
@@ -513,6 +547,14 @@ def generate_flight_report(
       <div class="stat-val">{len(category_counts)}</div>
       <div class="stat-lbl">Active Categories</div>
     </div>
+    <div class="stat-box">
+      <div class="stat-val" id="includedCount">{included_items:,}</div>
+      <div class="stat-lbl">Included in Review</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-val" id="skippedCount">{skipped_items:,}</div>
+      <div class="stat-lbl">Skipped by Review</div>
+    </div>
   </div>
 
   {timeline_html}
@@ -543,7 +585,8 @@ def generate_flight_report(
         const name = card.getAttribute('data-name') || '';
         const cats = card.getAttribute('data-cats') || '';
         const type = card.getAttribute('data-type') || '';
-        const match = name.includes(query) || cats.includes(query) || type.includes(query);
+        const reviewState = card.getAttribute('data-review-state') || '';
+        const match = name.includes(query) || cats.includes(query) || type.includes(query) || reviewState.includes(query);
         card.style.display = match ? 'block' : 'none';
       }});
     }}
@@ -559,6 +602,17 @@ def generate_flight_report(
       input.value = '';
       filterCatalog();
     }}
+
+    document.querySelectorAll('.cat-row').forEach(row => {{
+      const selectCategory = () => filterByCategory(row.getAttribute('data-category') || '');
+      row.addEventListener('click', selectCategory);
+      row.addEventListener('keydown', event => {{
+        if (event.key === 'Enter' || event.key === ' ') {{
+          event.preventDefault();
+          selectCategory();
+        }}
+      }});
+    }});
 
     // Cut block inspection
     document.querySelectorAll('.cut-block').forEach(block => {{
@@ -579,5 +633,5 @@ def generate_flight_report(
 </body>
 </html>
 """
-    output_path.write_text(html_content, encoding="utf-8")
+    _write_report(output_path, html_content)
     return output_path

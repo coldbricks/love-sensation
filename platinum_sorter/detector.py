@@ -11,6 +11,8 @@ import shutil
 import time
 import urllib.request
 
+from .contracts import DetectionResult
+
 LABELS = [
     "FEMALE_GENITALIA_COVERED", "FACE_FEMALE", "BUTTOCKS_EXPOSED",
     "FEMALE_BREAST_EXPOSED", "FEMALE_GENITALIA_EXPOSED", "MALE_BREAST_EXPOSED",
@@ -198,7 +200,7 @@ class GpuDetector:
                         if x2 > x1 and y2 > y1:
                             records.append({"class": LABELS[int(category)], "score": float(score),
                                             "box": [round(x1), round(y1), round(x2-x1), round(y2-y1)]})
-                    outputs[valid[position]] = records
+                    outputs[valid[position]] = DetectionResult(records, width=width, height=height)
                 if self.cuda:
                     torch.cuda.synchronize(self.device)
             except torch.cuda.OutOfMemoryError:

@@ -6,7 +6,7 @@
 
 # L O V E &nbsp; S E N S A T I O N
 
-### The Autonomous Media Workstation & PMV Forge for Windows 11
+### Private media review and video tools for Windows 11
 
 **Rhythm Intelligence. Scale-Invariant Neural Sorting. Zero Cloud Footprint.**<br>
 *Engineered from the silicon up for local NVIDIA CUDA FP16 tensor compute.*
@@ -15,7 +15,7 @@
   <a href="#quickstart"><img src="https://img.shields.io/badge/Windows_11-Workstation_Certified-e8c58a?style=for-the-badge&logo=windows11&logoColor=19181d&labelColor=19181d" alt="Windows 11"></a>
   <img src="https://img.shields.io/badge/NVIDIA_CUDA_12.8-RTX_5090_Ready-c4c7cd?style=for-the-badge&logo=nvidia&logoColor=76B900&labelColor=19181d" alt="NVIDIA CUDA accelerated">
   <img src="https://img.shields.io/badge/PyTorch-cu128_FP16-e5ddd4?style=for-the-badge&logo=pytorch&logoColor=EE4C2C&labelColor=19181d" alt="PyTorch cu128">
-  <a href="https://github.com/coldbricks/love-sensation/actions/workflows/tests.yml"><img src="https://img.shields.io/badge/Tests-89_Passed-a99b83?style=for-the-badge&logo=githubactions&logoColor=white&labelColor=19181d" alt="Tests"></a>
+  <a href="https://github.com/coldbricks/love-sensation/actions/workflows/tests.yml"><img src="https://github.com/coldbricks/love-sensation/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-d3d2d7?style=for-the-badge&labelColor=19181d" alt="AGPL-3.0"></a>
 </p>
 
@@ -39,11 +39,19 @@
 
 ## Architecture at a Glance
 
+### New in 2.1: Library & Review
+
+Folder setup collapses after analysis, leaving a larger results workspace with an inspector. Include or skip individual files, select several rows for batch review, and correct categories without discarding the original model detections. Review choices persist in saved runs.
+
+Press **Space** on a result to open an on-demand image/video preview. Press **Escape** to hide the workspace and owned Qt dialogs while work continues. Applying a run uses its full included set, independent of the current search filter.
+
+This release also fixes source-dimension normalization, sampled-video error states and caching, Forge startup and timing bounds, frame-rate labels, and safe repeat Harvester output. See the [current user guide](docs/USER_GUIDE.md) for the complete workflow and limitations. BeatEdit marker import remains future work.
+
 ```mermaid
 flowchart LR
     subgraph INGEST ["1. Library Ingestion"]
         A[Raw Video & Image Library] --> B[Lossless Comp Harvester]
-        B -->|NVDEC Cut Probing| C[Discrete Rhythm Takes]
+        B -->|Scene Detection| C[Extracted Clips]
     end
 
     subgraph COMPUTE ["2. CUDA Intelligence Engine"]
@@ -64,7 +72,7 @@ flowchart LR
     subgraph OUTPUT ["4. Workstation Artifacts"]
         L --> M[Premiere Pro / FCP7 XML Sequence]
         L --> N[Interactive Radar Cockpit Report]
-        E --> O[NTFS Instant Hardlinks 0-Byte Space]
+        E --> O[Verified Copy, Move or Hardlink]
     end
 
     style INGEST fill:#1c1a21,stroke:#77717f,stroke-width:1px,color:#d6d2db
@@ -81,12 +89,12 @@ flowchart LR
 
 | Pillar | Capability | Silicon Hot-Path |
 | :--- | :--- | :--- |
-| ⚡ **PMV Forge** | Frame-quantized music video assembly with drop detection, accelerating pre-drop fills, and blackout chokes. | CUDA Tensor Beat-Tracking & XML Generator |
-| ✂️ **Comp Harvester** | Lossless scene-cut splitting for compilation videos into reusable rhythm takes without transcoding. | Hardware NVDEC Probing & FFmpeg Copy Stream |
+| ⚡ **PMV Forge** | Frame-quantized sequence assembly using an estimated four-beat bar grid and validated source bounds. | CUDA audio analysis; XML export |
+| ✂️ **Comp Harvester** | Scene extraction with fast copy or accurate re-encoded cuts and measured output metadata. | FFmpeg; NVENC-first accurate encoding |
 | 👁️ **Scale-Invariant Vision** | Area-normalized prominence, aspect ratio profiling, and 85th-percentile sustained WOW scoring. | PyTorch cu128 FP16 NMS & Geometry Kernel |
-| 🔗 **NTFS Hardlinking** | Instantaneous zero-copy file organization on Windows NTFS drives with 0 bytes of disk overhead. | Win32 `CreateHardLinkW` with Atomic Fallback |
+| 🔗 **NTFS Hardlinking** | Shared-data file organization, with hash verification and independent-copy fallback where needed. | Win32 `CreateHardLinkW` with verified copy fallback |
 | 🎛️ **Flight Report Cockpit** | Standalone zero-dependency HTML dashboard with SVG waveform radar, cut lanes, and ranked contact sheets. | Client-Side Vector SVG Radar Scope Engine |
-| 🕶️ **Stealth Loupe & Panic** | Instant floating frosted glass inspection HUD on `Spacebar` / hover, with instant `Esc` panic screen wipe. | Hardware-Accelerated Qt Viewport Subsystem |
+| 🕶️ **Private review** | On-demand previews on Space and a workspace/dialog shield on Escape. | CUDA preview processing and Qt interface |
 
 </div>
 
@@ -100,10 +108,10 @@ The **PMV Forge** turns your sorted library into musical cinema. Ingest any soun
 
 ### Musical Assembly Grammar
 
-- **Downbeat Anchors**: High-prominence media synced precisely to bar downbeat frames.
-- **Pre-Drop Acceleration Fills**: The engine detects approaching energy peaks and triggers exponentially accelerating cuts ($1/2\text{ bar} \rightarrow 1/4\text{ bar} \rightarrow 1/8\text{ bar} \rightarrow \text{stutter}$).
-- **Drop Downbeat Blackout Chokes**: Visual blackout choke directly preceding the drop impact, followed by peak sustained-WOW takes.
-- **Breakdown Holds**: Ken Burns pan/zoom focal holds during quiet musical passages with smooth cross-dissolves.
+- **Estimated bar anchors**: Clips align to a four-beat grid. Tempo and bar phase require creative review.
+- **Fill subdivisions**: Additional cuts can subdivide selected bars; boundaries are constrained to source footage and song duration.
+- **Section tags**: Drop/fill/choke labels describe the generated plan. A choke tag does not itself render a blackout effect.
+- **Breakdown holds**: Longer holds and dissolve elements are supported. Automated Ken Burns animation is not authored by the XML exporter.
 - **The Chaos Knob (0.0 to 1.0)**:
   - `0.0`: Strict rhythmic repetition, steady tempo-locked cuts.
   - `0.5`: Balanced musical pacing with dynamic energy shifts.
@@ -117,7 +125,9 @@ The **PMV Forge** turns your sorted library into musical cinema. Ingest any soun
 Don't let multi-hour compilations sit in a folder unindexed. The **Comp Harvester** runs hardware-accelerated scene-cut thresholding across long videos to carve out continuous takes:
 
 - **Lossless Stream-Copying**: Extracts scenes using `-c copy` directly into independent files in seconds without generational compression loss.
-- **Rhythm-Ready Takes**: Each harvested take is cataloged with duration, resolution, frame rate, and geometric metrics, immediately ready for the PMV Forge.
+- **Measured take metadata**: Each take records its actual duration, dimensions and frame rate. Open the extracted folder in Library & Review and analyze it before supplying its results to Forge.
+- **Accurate mode**: Re-encodes at requested boundaries with NVENC when available. Fast stream copy can preserve keyframe preroll.
+- **Separate run folders**: Repeated extraction never reuses the previous run's output paths.
 
 ---
 
@@ -129,7 +139,7 @@ $$\text{Prominence} = \text{Confidence} \times \sqrt{\frac{\text{Bounding Box Ar
 
 $$\text{Sustained Video WOW} = \text{Percentile}_{85}\left(\{\text{Frame Prominence Scores}\}\right)$$
 
-- **Ken Burns Targeter**: Automatically extracts normalized $(x, y)$ focal coordinates to center pan and zoom keyframes on the subject.
+- **Saved geometry**: Preserves detection boxes and representative video timestamps for inspection; this does not automatically create pan/zoom keyframes.
 - **Face Crop Studio**: Extract and export high-resolution face crops with customizable padding (0–30%) without touching source files.
 
 ![Face Crop Preview and Export](docs/images/face-crops.png)
@@ -140,8 +150,8 @@ $$\text{Sustained Video WOW} = \text{Percentile}_{85}\left(\{\text{Frame Promine
 
 Organizing a 5 TB library used to mean waiting hours for file copies or risking folder moves. Love Sensation features native Windows NTFS hardlink integration:
 
-- **Zero Additional Disk Space**: Creates hardlink filesystem pointers instantaneously. A 100 GB folder organizes in under one second.
-- **Safety First**: Preserves immutable source files, executes Win32 `OPEN_REPARSE_POINT` handle validation, logs `.wal.jsonl` atomic write-ahead journals, and verifies SHA-256 hashes.
+- **Shared file data**: Hardlinks avoid duplicating file contents on a supported volume. Hash verification still reads the data, and filesystem metadata uses space.
+- **Verified operations**: Uses handle validation, `.wal.jsonl` recovery journals and SHA-256 verification. Hardlinks remain writable aliases: editing either path changes the same data. Use Copy for independent files.
 - **Seamless Cross-Volume Fallback**: If an output folder crosses physical drive boundaries, the engine seamlessly falls back to verified atomic streaming copy.
 
 ---
@@ -153,7 +163,7 @@ Every sorting run and PMV assembly can export an interactive, standalone HTML **
 - **Self-Contained**: 100% zero external CDN dependencies; renders entirely offline.
 - **Vector Waveform Radar Scope**: Embedded SVG visualizer displaying audio energy, beat lines, and drop zones.
 - **Cut Timeline Lane**: Interactive horizontal visualizer mapping every sequence cut to the underlying soundtrack.
-- **Prominence-Ranked Media Grid**: Clickable contact sheets showing detected classes, aspect ratios, and focal points.
+- **Media catalog**: Metadata cards showing names, review state and model metrics; media playback is not embedded.
 
 ---
 
@@ -185,9 +195,9 @@ Double-click **`Launch Love Sensation.vbs`**, or run:
 
 ## Private by Design
 
-- **100% Local Processing**: Zero cloud uploads, zero telemetry, zero analytics, zero external network calls.
-- **Stealth Loupe**: Hold `Spacebar` or hover over any media card for an instant floating frosted glass loupe.
-- **Panic Wipe**: Press `Esc` anywhere to instantly close previews and minimize/wipe the application from the desktop.
+- **Local media processing**: Media stays on the device. Initial setup can download dependencies and the verified detector model.
+- **On-demand previews**: Press Space on a focused result to toggle its preview. No hover reveal or disk thumbnail cache.
+- **Privacy shield**: Escape conceals the workspace and owned Qt dialogs. Resume explicitly restores them, with previews closed. External browsers and editors are separate applications.
 - **Excluded by Version Control**: All user media, detection caches (`data/`), model weights (`models/`), and export journals are strictly ignored by Git.
 
 ---

@@ -11,6 +11,7 @@ from platinum_sorter.video_engine import (
     sample_video_frames,
     detect_scene_cuts,
     split_compilation,
+    _h264_encoder,
 )
 
 
@@ -25,7 +26,7 @@ class VideoEngineTests(unittest.TestCase):
         cmd = [
             "ffmpeg", "-y", "-v", "error",
             "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=30",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:v", _h264_encoder(), "-pix_fmt", "yuv420p",
             str(cls.sample_video),
         ]
         subprocess.run(cmd, check=True)
@@ -35,7 +36,7 @@ class VideoEngineTests(unittest.TestCase):
             "ffmpeg", "-y", "-v", "error",
             "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=30",
             "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:v", _h264_encoder(), "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             str(cls.sample_av_video),
         ]
@@ -90,7 +91,7 @@ class VideoEngineTests(unittest.TestCase):
         self.assertTrue(takes[0].is_file())
 
         # Verify takes_manifest.json
-        manifest_path = out_dir / "takes_manifest.json"
+        manifest_path = takes[0].parent / "takes_manifest.json"
         self.assertTrue(manifest_path.is_file())
         import json
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -158,6 +159,54 @@ class VideoEngineTests(unittest.TestCase):
         frames = sample_video_frames(self.sample_video, sample_fps=10.0, max_frames=3)
         self.assertGreaterEqual(len(frames), 1)
         self.assertLessEqual(len(frames), 3)
+
+    def test_long_scene_tail_and_actual_manifest_duration(self):
+        from unittest.mock import patch
+        with patch('platinum_sorter.video_engine.detect_scene_cuts',return_value=[0.]):
+            takes=split_compilation(self.sample_video,self.dir_path/'tail',max_take_duration=.8,min_take_duration=.1)
+        manifest=json.loads((takes[0].parent/'takes_manifest.json').read_text())
+        self.assertEqual(len(takes),3)
+        self.assertAlmostEqual(manifest['takes'][-1]['requested_end_s'],2,places=2)
+        self.assertAlmostEqual(sum(r['requested_duration_s'] for r in manifest['takes']),2,places=2)
+        for path,record in zip(takes,manifest['takes']):
+            self.assertEqual(record['duration_s'],probe_media_file(path)['duration_s'])
+
+    def test_accurate_cut_duration_and_audio_preservation(self):
+        from unittest.mock import patch
+        with patch('platinum_sorter.video_engine.detect_scene_cuts',return_value=[0.,.7,1.3]):
+            takes=split_compilation(self.sample_av_video,self.dir_path/'accurate',min_take_duration=.1,cut_mode='accurate')
+        self.assertEqual(len(takes),3)
+        for path,expected in zip(takes,[.7,.6,.7]):
+            info=probe_media_file(path)
+            self.assertAlmostEqual(info['duration_s'],expected,delta=.05)
+            self.assertTrue(info['has_audio'])
+
+    def test_sampling_reports_frame_times_and_cancels(self):
+        import threading
+        frames=sample_video_frames(self.sample_video,sample_fps=2,max_frames=4)
+        self.assertEqual(len(frames),4)
+        self.assertTrue(all(abs(ts*30-round(ts*30))<.001 for ts,_ in frames))
+        self.assertTrue(all(a[0]<b[0] for a,b in zip(frames,frames[1:])))
+        cancelled=threading.Event(); cancelled.set()
+        with self.assertRaises(InterruptedError): sample_video_frames(self.sample_video,cancel_event=cancelled)
+
+    def test_repeated_harvest_preserves_prior_takes_and_manifest(self):
+        import hashlib
+        from unittest.mock import patch
+        destination=self.dir_path/'repeat'
+        events=[]
+        with patch('platinum_sorter.video_engine.detect_scene_cuts',side_effect=lambda *a,**kw:[0.]):
+            first=split_compilation(self.sample_video,destination,min_take_duration=.1,emit=events.append)
+            first_files=first+[first[0].parent/'takes_manifest.json']
+            before={p:hashlib.sha256(p.read_bytes()).hexdigest() for p in first_files}
+            second=split_compilation(self.sample_video,destination,min_take_duration=.1,emit=events.append)
+        self.assertNotEqual(first[0].parent,second[0].parent)
+        self.assertEqual(first[0].parent.parent,destination)
+        self.assertEqual(second[0].parent.parent,destination)
+        self.assertEqual(before,{p:hashlib.sha256(p.read_bytes()).hexdigest() for p in first_files})
+        self.assertTrue((second[0].parent/'takes_manifest.json').is_file())
+        started=[ev['output_dir'] for ev in events if ev['type']=='harvest_started']
+        self.assertEqual(started,[str(first[0].parent),str(second[0].parent)])
 
 
 if __name__ == "__main__":

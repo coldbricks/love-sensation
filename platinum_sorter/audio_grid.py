@@ -30,7 +30,7 @@ def load_mono_audio(path: Path | str, sr: int = SR) -> np.ndarray:
         "-",
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, check=True)
+        proc = subprocess.run(cmd, capture_output=True, check=True, timeout=180)
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else str(exc)
         raise ValueError(f"Failed to decode audio file {path}: {stderr}") from exc
@@ -78,28 +78,41 @@ def detect_tempo_and_grid(
     samples = load_mono_audio(audio_path, sr=SR)
     total_duration = float(len(samples) / SR)
 
-    # Handle short audio snippet gracefully
-    if total_duration < 1.0:
-        bpm = requested_bpm or 120.0
-        period = 60.0 / bpm
+    def no_grid(reason):
         return {
-            "bpm": round(bpm, 2),
-            "beat_period": round(period, 4),
+            "bpm": None,
+            "beat_period": None,
             "first_beat_s": 0.0,
             "total_duration_s": round(total_duration, 3),
-            "beat_count": max(1, int(total_duration / period)),
-            "bar_count": 1,
-            "beats": [0.0],
-            "bars": [0.0],
+            "beat_count": 0,
+            "bar_count": 0,
+            "beats": [],
+            "bars": [],
             "drop_bars": [],
             "breakdown_bars": [],
-            "energy_per_bar": [0.5],
+            "energy_per_bar": [],
+            "reliable": False,
+            "reason": reason,
+            "confidence": 0.0,
+            "waveform_svg": generate_waveform_svg_points(samples=samples),
             "device": str(device),
             "device_name": device_name,
         }
 
+    if requested_bpm is not None and (not math.isfinite(requested_bpm) or requested_bpm <= 0):
+        raise ValueError("Requested BPM must be finite and positive")
+    if not (math.isfinite(min_bpm) and math.isfinite(max_bpm) and 0 < min_bpm < max_bpm):
+        raise ValueError("Invalid tempo search range")
+    if total_duration < 1.0:
+        return no_grid("Track is too short to estimate a beat grid")
+
     wave = torch.from_numpy(samples).to(device)
+    if not bool(torch.isfinite(wave).all().item()):
+        raise ValueError("Audio contains non-finite samples")
     flux, times = compute_onset_envelope(wave, hop_size=HOP)
+    rms = float(wave.square().mean().sqrt().item())
+    if rms < 1e-6 or float(flux.max().item()) < max(1e-8, rms * .02):
+        return no_grid("No usable rhythmic onsets; choose another track")
 
     # Search tempo via Fourier phase coherence (bounded window for long tracks)
     max_search_hops = int(180.0 / (HOP / SR))
@@ -107,7 +120,7 @@ def detect_tempo_and_grid(
     times_search = times[:max_search_hops] if times.numel() > max_search_hops else times
 
     if requested_bpm and requested_bpm > 0:
-        bpm_hypotheses = torch.linspace(requested_bpm - 4.0, requested_bpm + 4.0, 161, device=device)
+        bpm_hypotheses = torch.tensor([requested_bpm], device=device)
     else:
         bpm_hypotheses = torch.linspace(min_bpm, max_bpm, int((max_bpm - min_bpm) / 0.1) + 1, device=device)
 
@@ -117,12 +130,16 @@ def detect_tempo_and_grid(
     real = angles.cos() @ centered
     imag = -(angles.sin() @ centered)
     powers = real.square() + imag.square()
+    coherence = float((powers.max().sqrt() / flux_search.sum().clamp_min(1e-12)).item())
+    if requested_bpm is None and coherence < .1:
+        return no_grid("No stable periodic beat found; enter a BPM to set the tempo manually")
 
     best_idx = int(powers.argmax().item()) if powers.numel() > 0 else 0
     detected_bpm = round(float(bpm_hypotheses[best_idx].item()), 2) if powers.numel() > 0 else (requested_bpm or 120.0)
     beat_period = 60.0 / detected_bpm
 
-    # Phase calculation via comb-filter energy integration on GPU (locks to real downbeats)
+    # Onset phase estimate. Every fourth beat is assumed to begin a 4/4 bar;
+    # this is not a meter/downbeat classifier.
     period_hops = beat_period / (HOP / SR)
     if period_hops >= 2.0 and flux.numel() > period_hops:
         int_period = max(2, int(round(period_hops)))
@@ -155,22 +172,17 @@ def detect_tempo_and_grid(
         t += bar_len
 
     # Per-bar energy profile (RMS)
-    samples_cpu = samples
-    energy_per_bar = []
-    for i in range(len(bars)):
-        t_start = bars[i]
-        t_end = bars[i + 1] if i + 1 < len(bars) else total_duration
-        idx_start = int(t_start * SR)
-        idx_end = int(t_end * SR)
-        chunk = samples_cpu[idx_start:idx_end]
-        rms = float(np.sqrt(np.mean(chunk ** 2))) if len(chunk) > 0 else 0.0
-        energy_per_bar.append(rms)
+    boundaries = torch.tensor([min(len(samples), int(t * SR)) for t in bars] + [len(samples)], device=device)
+    cumulative = torch.nn.functional.pad(wave.square().cumsum(0), (1, 0))
+    energy = ((cumulative[boundaries[1:]] - cumulative[boundaries[:-1]]).clamp_min(0) /
+              (boundaries[1:] - boundaries[:-1]).clamp_min(1)).sqrt()
+    energy_per_bar = energy.cpu().tolist()
 
     # Detect drops and breakdowns (drops require post-intro bar >= 4)
     drop_bars = []
     breakdown_bars = []
     if energy_per_bar:
-        median_e = float(np.median(energy_per_bar)) or 1e-4
+        median_e = float(torch.quantile(energy, .5).item()) or 1e-4
         for b in range(1, len(energy_per_bar)):
             e_prev = energy_per_bar[b - 1]
             e_curr = energy_per_bar[b]
@@ -196,6 +208,12 @@ def detect_tempo_and_grid(
         "breakdown_bars": breakdown_bars,
         "energy_per_bar": [round(e, 4) for e in energy_per_bar],
         "waveform_svg": waveform_svg,
+        "reliable": True,
+        "confidence": round(min(1.0, coherence), 4),
+        "tempo_source": "manual" if requested_bpm is not None else "estimated",
+        "meter_note": "Fixed tempo; 4/4 bars assumed. Half/double-time ambiguity remains.",
+        "device": str(device),
+        "device_name": device_name,
     }
 
 
@@ -217,18 +235,16 @@ def generate_waveform_svg_points(
     if len(samples) == 0:
         return f"0,{height/2} {width},{height/2}"
 
-    x = np.abs(samples)
-    n = max(len(x) // width, 1)
-    m = len(x) // n
-    if m <= 0:
-        return f"0,{height/2} {width},{height/2}"
-    env = x[: m * n].reshape(m, n).max(axis=1)
-    max_val = float(env.max()) or 1.0
-    env = env / max_val
+    if width < 2 or height < 2:
+        raise ValueError("Waveform dimensions must be at least two")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    x = torch.as_tensor(samples, dtype=torch.float32, device=device).abs()
+    env = torch.nn.functional.adaptive_max_pool1d(x[None, None], width)[0, 0]
+    env = (env / env.max().clamp_min(1e-12)).cpu().tolist()
 
     mid = height / 2.0
     half = (height / 2.0) - 1.0
 
-    top_pts = [f"{i * width / max(m, 1):.1f},{mid - e * half:.1f}" for i, e in enumerate(env)]
-    bot_pts = [f"{i * width / max(m, 1):.1f},{mid + e * half:.1f}" for i, e in enumerate(reversed(env))]
+    top_pts = [f"{i * width / (width - 1):.1f},{mid - e * half:.1f}" for i, e in enumerate(env)]
+    bot_pts = [f"{i * width / (width - 1):.1f},{mid + env[i] * half:.1f}" for i in range(width - 1, -1, -1)]
     return " ".join(top_pts + bot_pts)

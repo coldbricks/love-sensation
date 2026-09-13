@@ -9,29 +9,28 @@ from PySide6.QtGui import QColor, QDesktopServices, QFont, QLinearGradient, QPai
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QFileDialog, QSlider, QSpinBox, QMessageBox, QFrame, QProgressBar,
-    QWidget, QScrollArea,
+    QWidget, QScrollArea, QDoubleSpinBox, QComboBox,
 )
 
 from .audio_grid import detect_tempo_and_grid, generate_waveform_svg_points
-from .pmv_forge import assemble_pmv_timeline, export_fcp7_xml
+from .pmv_forge import assemble_pmv_timeline, export_fcp7_xml, prepare_candidate_clips
+from .video_engine import is_video_path
 from .flight_report import generate_flight_report
 
 
 class BeatWorker(QThread):
-    finished = Signal(dict)
-    failed = Signal(str)
-
     def __init__(self, audio_path: str, requested_bpm: float | None = None):
         super().__init__()
         self.audio_path = audio_path
         self.requested_bpm = requested_bpm
+        self.result = None
+        self.error = None
 
     def run(self):
         try:
-            grid = detect_tempo_and_grid(self.audio_path, requested_bpm=self.requested_bpm)
-            self.finished.emit(grid)
+            self.result = detect_tempo_and_grid(self.audio_path, requested_bpm=self.requested_bpm)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.error = str(exc)
 
 
 class PmvForgeDialog(QDialog):
@@ -61,7 +60,58 @@ class PmvForgeDialog(QDialog):
         self.candidate_clips = candidate_clips or []
         self.audio_grid: dict | None = None
         self._worker: BeatWorker | None = None
+        self._pending_identity = None
+        self._analyzed_identity = None
+        self._close_when_finished = False
         self._build_ui()
+        self.audio_edit.textChanged.connect(self._invalidate_audio_grid)
+        self.bpm_spin.valueChanged.connect(self._invalidate_audio_grid)
+
+    def _audio_identity(self):
+        try:
+            path = Path(self.audio_edit.text().strip()).resolve()
+            stat = path.stat()
+            return (str(path), stat.st_size, stat.st_mtime_ns, self.bpm_spin.value()) if path.is_file() else None
+        except OSError:
+            return None
+
+    def _invalidate_audio_grid(self, *_):
+        self.audio_grid = None
+        self._analyzed_identity = None
+        self.assemble_btn.setEnabled(False)
+        self.grid_summary.setText("Track or tempo changed · Analyze Track to refresh the grid")
+
+    def closeEvent(self, event):
+        if self._worker is not None:
+            self._close_when_finished = True
+            event.ignore()
+            self.grid_summary.setText("Closing when audio analysis finishes…")
+        else:
+            super().closeEvent(event)
+
+    def reject(self):
+        if self._worker is not None:
+            self._close_when_finished = True
+            self.grid_summary.setText("Closing when audio analysis finishes…")
+            return
+        super().reject()
+
+    def _finish_beat_worker(self):
+        worker = self._worker
+        if worker is None:
+            return
+        worker.wait()
+        self._worker = None
+        self.progress_bar.hide()
+        self.analyze_beat_btn.setEnabled(True)
+        if not self._close_when_finished:
+            if worker.error is not None:
+                self._on_beat_failed(worker.error)
+            elif worker.result is not None:
+                self._on_beat_finished(worker.result)
+        worker.deleteLater()
+        if self._close_when_finished:
+            super().reject()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -187,39 +237,54 @@ class PmvForgeDialog(QDialog):
     def _browse_audio(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Choose Audio Track", "",
-            "Audio Files (*.wav *.mp3 *.flac *.ogg *.m4a *.aac);;All Files (*)"
+            "Audio Files (*.wav *.mp3 *.flac *.ogg *.m4a *.aac);;All Files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if file_path:
             self.audio_edit.setText(file_path)
 
     def _start_beat_analysis(self):
+        if self._worker is not None:
+            return
         path = self.audio_edit.text().strip()
         if not path or not Path(path).is_file():
             QMessageBox.warning(self, "Invalid Audio", "Please choose an existing audio track.")
             return
         self.progress_bar.show()
+        self._invalidate_audio_grid()
+        self._pending_identity = self._audio_identity()
         self.status_pill.setText("ANALYZING BEATS")
         self.analyze_beat_btn.setEnabled(False)
         req_bpm = self.bpm_spin.value() if self.bpm_spin.value() > 0 else None
         self._worker = BeatWorker(path, requested_bpm=req_bpm)
-        self._worker.finished.connect(self._on_beat_finished)
-        self._worker.failed.connect(self._on_beat_failed)
+        self._worker.finished.connect(self._finish_beat_worker)
         self._worker.start()
 
     def _on_beat_finished(self, grid: dict):
         self.progress_bar.hide()
         self.analyze_beat_btn.setEnabled(True)
+        if self._pending_identity != self._audio_identity():
+            self._invalidate_audio_grid()
+            self.status_pill.setText("TRACK CHANGED")
+            return
+        if grid.get("reliable") is False or not grid.get("bars"):
+            self._invalidate_audio_grid()
+            self.status_pill.setText("NO GRID")
+            self.grid_summary.setText(grid.get("reason") or "No reliable rhythmic grid was found")
+            return
         self.audio_grid = grid
+        self._analyzed_identity = self._pending_identity
         bpm = grid.get("bpm", 0.0)
         bars = len(grid.get("bars", []))
         drops = len(grid.get("drop_bars", []))
         dur = grid.get("total_duration_s", 0.0)
         self.status_pill.setText(f"{bpm} BPM")
-        self.grid_summary.setText(f"Locked: {bpm} BPM &bull; {bars} bars ({dur:.1f}s) &bull; {drops} drop cues identified")
+        self.grid_summary.setText(f"Estimated grid: {bpm} BPM · {bars} bars ({dur:.1f}s) · 4/4 assumed")
         self.grid_summary.setStyleSheet("color: #e8c58a; font-weight: 600;")
         self.assemble_btn.setEnabled(True)
 
     def _on_beat_failed(self, error: str):
+        self._invalidate_audio_grid()
         self.progress_bar.hide()
         self.analyze_beat_btn.setEnabled(True)
         self.status_pill.setText("ERROR")
@@ -228,20 +293,30 @@ class PmvForgeDialog(QDialog):
     def _assemble_and_export(self):
         if not self.audio_grid:
             return
+        if self._analyzed_identity != self._audio_identity():
+            self._invalidate_audio_grid()
+            QMessageBox.warning(self, "Track Changed", "Analyze the current soundtrack before exporting.")
+            return
         if not self.candidate_clips:
             # Fallback: browse for clips folder if none passed
-            folder = QFileDialog.getExistingDirectory(self, "Select Folder of Video Clips for Assembly")
+            folder = QFileDialog.getExistingDirectory(self, "Select Folder of Video Clips for Assembly",
+                options=QFileDialog.Option.DontUseNativeDialog)
             if not folder:
                 return
-            exts = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
-            clips = [{"path": str(p), "duration_s": 5.0, "prominence": 0.5} for p in Path(folder).iterdir() if p.suffix.lower() in exts]
+            clips = [{"path": str(p)} for p in sorted(Path(folder).iterdir()) if p.is_file() and is_video_path(p)]
             if not clips:
                 QMessageBox.warning(self, "No Clips Found", "No video clips found in the selected folder.")
                 return
             self.candidate_clips = clips
+        try:
+            self.candidate_clips = prepare_candidate_clips(self.candidate_clips)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Media Unavailable", str(exc))
+            return
 
         out_xml, _ = QFileDialog.getSaveFileName(
-            self, "Save Premiere Pro XML Sequence", "pmv_assembly.xml", "Final Cut Pro XML (*.xml)"
+            self, "Save Premiere Pro XML Sequence", "pmv_assembly.xml", "Final Cut Pro XML (*.xml)",
+            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not out_xml:
             return
@@ -249,10 +324,13 @@ class PmvForgeDialog(QDialog):
         fps_val = self.fps_combo.currentData() or 30
         chaos = self.chaos_slider.value() / 100.0
         seed = self.seed_spin.value()
-        cuts = assemble_pmv_timeline(self.audio_grid, self.candidate_clips, chaos=chaos, seed=seed, fps=fps_val)
         audio_path = self.audio_edit.text().strip()
-
-        export_fcp7_xml(cuts, audio_path, out_xml, fps=fps_val)
+        try:
+            cuts = assemble_pmv_timeline(self.audio_grid, self.candidate_clips, chaos=chaos, seed=seed, fps=fps_val)
+            export_fcp7_xml(cuts, audio_path, out_xml, fps=fps_val)
+        except (ValueError, OSError, RuntimeError) as exc:
+            QMessageBox.warning(self, "Export Not Completed", str(exc))
+            return
 
         # Also generate matching flight_report.html
         report_html = Path(out_xml).with_suffix(".html")

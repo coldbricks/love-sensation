@@ -1,21 +1,19 @@
-"""Desktop interface for the local image organizer.
-
-Model construction and all filesystem processing run on the worker thread.
-The interface only displays filenames and detection metadata, never images.
-"""
+"""Private media review. Processing and on-demand previews run off the UI thread."""
 from __future__ import annotations
 
 import json
+import copy
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QAbstractTableModel, QModelIndex, QPointF, QRectF, QSortFilterProxyModel, Qt, QThread,
+    QAbstractTableModel, QEvent, QModelIndex, QPointF, QRectF, QSortFilterProxyModel, Qt, QThread,
     QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
@@ -23,10 +21,10 @@ from PySide6.QtGui import (
     QPainter, QPainterPath, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QLayout, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea,
-    QSizePolicy, QTableView, QToolButton, QVBoxLayout, QWidget,
+    QSizePolicy, QStackedWidget, QTableView, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .contracts import ImageResult, ScanReport, SortOptions
@@ -94,6 +92,7 @@ QToolTip { background: #302932; color: #f3eee4; border: 1px solid #a78b69; paddi
 
 def _label(text: str, name: str | None = None) -> QLabel:
     widget = QLabel(text)
+    widget.setTextFormat(Qt.TextFormat.PlainText)
     if name:
         widget.setObjectName(name)
     return widget
@@ -104,7 +103,11 @@ def _has_error(result: ImageResult) -> bool:
 
 
 def _actionable(result: ImageResult) -> bool:
-    return bool(result.categories and getattr(result, "sha256", "")) and result.status in {"ready", "error", "cancelled", "copying", "removing_source"}
+    return getattr(result, "included", True) and bool(result.categories and getattr(result, "sha256", "")) and result.status in {"ready", "error", "cancelled", "copying", "removing_source"}
+
+
+def _reviewable(result: ImageResult) -> bool:
+    return result.status == "ready" and bool(result.sha256) and not _has_error(result)
 
 
 def _matched(result: ImageResult) -> bool:
@@ -218,11 +221,28 @@ def _brand_icon() -> QIcon:
 
 class ResultsModel(QAbstractTableModel):
     HEADERS = ("FILE", "CATEGORIES", "CONFIDENCE", "STATUS")
+    review_requested = Signal(object, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.results: list[ImageResult] = []
         self._by_source: dict[str, int] = {}
+        self.review_enabled = True
+
+    def flags(self, index):
+        flags = super().flags(index)
+        if index.isValid() and index.column() == 0 and self.review_enabled and _reviewable(self.results[index.row()]):
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
+        return flags
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        if (role == Qt.ItemDataRole.CheckStateRole and index.isValid() and index.column() == 0
+                and self.review_enabled and _reviewable(self.results[index.row()])):
+            result = self.results[index.row()]
+            included = value == Qt.CheckState.Checked or value == Qt.CheckState.Checked.value
+            self.review_requested.emit(result, included)
+            return result.included == included
+        return False
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.results)
@@ -238,6 +258,8 @@ class ResultsModel(QAbstractTableModel):
         if not index.isValid():
             return None
         result = self.results[index.row()]
+        if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0 and _reviewable(result):
+            return Qt.CheckState.Checked if result.included else Qt.CheckState.Unchecked
         if role == Qt.ItemDataRole.UserRole:
             return result
         if role == Qt.ItemDataRole.UserRole + 1:
@@ -261,7 +283,8 @@ class ResultsModel(QAbstractTableModel):
                 result.relative_path or Path(result.source).name,
                 ", ".join(_readable(category) for category in result.categories) or ("—" if _has_error(result) else "Unmatched"),
                 f"{max(scores):.0%}" if scores else "—",
-                _readable(result.status) + (" · cached" if result.cached else ""),
+                ("Skipped by you" if not result.included and _reviewable(result) else _readable(result.status))
+                + (" · edited" if result.original_categories is not None else "") + (" · cached" if result.cached else ""),
             )
             return values[index.column()]
         return None
@@ -298,6 +321,10 @@ class ResultsFilter(QSortFilterProxyModel):
         if self.kind == "issues" and not _has_error(result):
             return False
         if self.kind == "matched" and not _matched(result):
+            return False
+        if self.kind == "included" and not result.included:
+            return False
+        if self.kind == "excluded" and result.included:
             return False
         if self.kind == "unmatched" and (_matched(result) or _has_error(result)):
             return False
@@ -345,6 +372,24 @@ class TaskWorker(QThread):
         except Exception as exc:
             logging.exception("%s worker failed", self.phase)
             self.failed.emit(str(exc) or type(exc).__name__)
+
+
+class ReviewPreviewWorker(QThread):
+    ready = Signal(int, object)
+
+    def __init__(self, generation, result, parent=None):
+        super().__init__(parent)
+        self.generation = generation
+        self.result = copy.deepcopy(result)
+        self.cancel_event = threading.Event()
+
+    def run(self):
+        try:
+            from .review_preview import render_preview
+            value = render_preview(self.result, cancel_event=self.cancel_event)
+        except Exception as error:
+            value = {"error": str(error)}
+        self.ready.emit(self.generation, value)
 
 
 class StealthLoupe(QFrame):
@@ -426,6 +471,11 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        # Import numerical libraries on Python's main thread. Cold imports from a
+        # QThread hit the PySide feature import hook on Windows/Python 3.14.
+        # Models, decoding and CUDA work still initialize on their workers.
+        from .review_preview import prepare_preview_runtime
+        prepare_preview_runtime()
         # The Windows offscreen Qt plugin omits the system font database.
         # Register installed fonts only for that case, including screenshot QA.
         if not QFontDatabase.families():
@@ -453,6 +503,12 @@ class MainWindow(QMainWindow):
         self._face_crop_dialog = None
         self._loupe: StealthLoupe | None = None
         self._categories: dict[str, QCheckBox] = {}
+        self._privacy_active = False
+        self._preview_generation = 0
+        self._preview_worker = None
+        self._preview_pending = None
+        from .privacy import DialogMasks
+        self._dialog_masks = DialogMasks(self)
         self._settings_timer = QTimer(self)
         self._settings_timer.setSingleShot(True)
         self._settings_timer.timeout.connect(self._save_settings)
@@ -464,10 +520,27 @@ class MainWindow(QMainWindow):
         self._load_settings()
         self._connect_options()
         self._refresh_actions()
+        QApplication.instance().installEventFilter(self)
 
     def _build_ui(self):
         central = QWidget()
-        self.setCentralWidget(central)
+        self.workspace_stack = QStackedWidget()
+        self.workspace_stack.addWidget(central)
+        self.privacy_page = QWidget()
+        hidden_layout = QVBoxLayout(self.privacy_page)
+        hidden_layout.addStretch()
+        hidden_title = _label("Workspace hidden", "title")
+        hidden_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hidden_layout.addWidget(hidden_title)
+        hidden_hint = _label("Your work continues in the background.", "muted")
+        hidden_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hidden_layout.addWidget(hidden_hint)
+        self.resume_button = QPushButton("Resume workspace")
+        self.resume_button.clicked.connect(lambda: self._set_privacy(False))
+        hidden_layout.addWidget(self.resume_button, 0, Qt.AlignmentFlag.AlignCenter)
+        hidden_layout.addStretch()
+        self.workspace_stack.addWidget(self.privacy_page)
+        self.setCentralWidget(self.workspace_stack)
         shell = QHBoxLayout(central)
         shell.setContentsMargins(0, 0, 0, 0)
         shell.setSpacing(0)
@@ -485,11 +558,11 @@ class MainWindow(QMainWindow):
         brand = _label("LOVE\nSENSATION")
         brand.setStyleSheet("font-family: 'Century Gothic'; font-size: 24px; font-weight: 700; letter-spacing: 0.5px; color: #e8e2dd; background: transparent;")
         side.addWidget(brand)
-        side.addWidget(_label("PRIVATE IMAGE ORGANIZER", "eyebrow"))
+        side.addWidget(_label("PRIVATE MEDIA WORKSPACE", "eyebrow"))
         side.addSpacing(34)
         side.addWidget(_label("WORKSPACE", "eyebrow"))
         side.addSpacing(8)
-        active_nav = _label("Image organizer", "activeNav")
+        active_nav = _label("Library & Review", "activeNav")
         active_nav.setStyleSheet("background: #343036; border: 1px solid #6a5a49; border-radius: 6px; color: #f3dfbb; padding: 12px; font-weight: 600;")
         side.addWidget(active_nav)
         side.addSpacing(28)
@@ -509,13 +582,16 @@ class MainWindow(QMainWindow):
         self.pmv_forge_button.clicked.connect(self._open_pmv_forge)
         side.addWidget(self.pmv_forge_button)
         self.harvester_button = QPushButton("Comp Harvester…")
-        self.harvester_button.setToolTip("Lossless scene-cut splitting for compilation videos.")
+        self.harvester_button.setToolTip("Split videos into clips with fast or accurate extraction.")
         self.harvester_button.clicked.connect(self._open_harvester)
         side.addWidget(self.harvester_button)
         self.startup_audio_button = self.pmv_forge_button
         side.addStretch()
         privacy = _label("LOCAL & PRIVATE", "eyebrow")
         side.addWidget(privacy)
+        self.privacy_button = QPushButton("Hide workspace · Esc")
+        self.privacy_button.clicked.connect(lambda: self._set_privacy(True))
+        side.addWidget(self.privacy_button)
         note = _label("Your files stay on this device.\nReview every run before sorting.", "muted")
         note.setWordWrap(True)
         note.setStyleSheet("line-height: 1.4; color: #aaa6aa; font-size: 12px; background: transparent;")
@@ -524,14 +600,13 @@ class MainWindow(QMainWindow):
 
         body = QWidget()
         content = QVBoxLayout(body)
-        content.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         content.setContentsMargins(26, 23, 26, 12)
         content.setSpacing(12)
         heading = QHBoxLayout()
         titles = QVBoxLayout()
         titles.setSpacing(4)
-        titles.addWidget(_label("Image organizer", "title"))
-        titles.addWidget(_label("Find what belongs together. Keep every original accounted for.", "muted"))
+        titles.addWidget(_label("Library & Review", "title"))
+        titles.addWidget(_label("Inspect your media. Choose what to keep. Apply with confidence.", "muted"))
         heading.addLayout(titles)
         heading.addStretch()
         self.masthead_art = _label("", "mastheadArt")
@@ -549,19 +624,31 @@ class MainWindow(QMainWindow):
         config.setContentsMargins(18, 14, 18, 12)
         config.setSpacing(10)
         config_header = QHBoxLayout()
-        config_header.addWidget(_label("Folders & sorting", "section"))
+        self.setup_toggle = QToolButton()
+        self.setup_toggle.setText("Folders & sorting")
+        self.setup_toggle.setCheckable(True)
+        self.setup_toggle.setChecked(True)
+        self.setup_toggle.setArrowType(Qt.ArrowType.DownArrow)
+        self.setup_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        config_header.addWidget(self.setup_toggle)
         config_header.addStretch()
         config_header.addWidget(_label("1  /  SET UP", "eyebrow"))
         config.addLayout(config_header)
+        self.setup_contents = QWidget()
+        setup_layout = QVBoxLayout(self.setup_contents)
+        setup_layout.setContentsMargins(0, 0, 0, 0)
+        setup_layout.setSpacing(10)
+        config.addWidget(self.setup_contents)
+        self.setup_toggle.toggled.connect(self._toggle_setup)
         paths = QGridLayout()
         paths.setHorizontalSpacing(10)
         paths.setVerticalSpacing(8)
         self.source_edit = QLineEdit()
-        self.source_edit.setPlaceholderText("Choose a folder of images to organize")
+        self.source_edit.setPlaceholderText("Choose a folder of images and videos")
         self.source_edit.setAccessibleName("Source folder")
         self.source_edit.setMinimumHeight(38)
         self.destination_edit = QLineEdit()
-        self.destination_edit.setPlaceholderText("Choose where sorted images will go")
+        self.destination_edit.setPlaceholderText("Choose where included files will go")
         self.destination_edit.setAccessibleName("Output folder")
         self.destination_edit.setMinimumHeight(38)
         for row, (name, edit) in enumerate((("Source folder", self.source_edit), ("Output folder", self.destination_edit))):
@@ -572,7 +659,7 @@ class MainWindow(QMainWindow):
             browse.clicked.connect(lambda checked=False, target=edit, title=name: self._browse(target, title))
             paths.addWidget(browse, row, 2)
         paths.setColumnStretch(1, 1)
-        config.addLayout(paths)
+        setup_layout.addLayout(paths)
         choices = QHBoxLayout()
         choices.setSpacing(14)
         self.mode_combo = QComboBox()
@@ -591,7 +678,8 @@ class MainWindow(QMainWindow):
         self.operation_combo = QComboBox()
         self.operation_combo.addItem("Copy originals", "copy")
         self.operation_combo.addItem("Move originals", "move")
-        self.operation_combo.addItem("Hardlink (NTFS zero-space)", "hardlink")
+        self.operation_combo.addItem("Hardlink (shared file data)", "hardlink")
+        self.operation_combo.setToolTip("Copy creates independent files. Hardlinks share writable contents: editing either name changes both. Unsupported hardlinks fall back to copies.")
         self.operation_combo.setAccessibleName("File operation")
         for title, control in (("MATCHES", self.mode_combo), ("MIN. CONFIDENCE", self.confidence_spin), ("FILE OPERATION", self.operation_combo)):
             group = QVBoxLayout()
@@ -603,14 +691,14 @@ class MainWindow(QMainWindow):
         self.unmatched_check.setChecked(True)
         self.unmatched_check.setToolTip("Place images with no selected matches in an Unmatched folder.")
         choices.addWidget(self.unmatched_check, 0, Qt.AlignmentFlag.AlignBottom)
-        config.addLayout(choices)
+        setup_layout.addLayout(choices)
         self.category_toggle = QToolButton()
         self.category_toggle.setText("Choose categories  ·  all included")
         self.category_toggle.setCheckable(True)
         self.category_toggle.setArrowType(Qt.ArrowType.RightArrow)
         self.category_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.category_toggle.toggled.connect(self._toggle_categories)
-        config.addWidget(self.category_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+        setup_layout.addWidget(self.category_toggle, 0, Qt.AlignmentFlag.AlignLeft)
         self.category_area = QScrollArea()
         self.category_area.setWidgetResizable(True)
         self.category_area.setMaximumHeight(140)
@@ -646,27 +734,29 @@ class MainWindow(QMainWindow):
             category_grid.addWidget(_label("Category filters will be available after the detector is installed.", "muted"), 0, 0)
         self.category_area.setWidget(category_widget)
         self.category_area.hide()
-        config.addWidget(self.category_area)
+        setup_layout.addWidget(self.category_area)
         content.addWidget(self.options_card)
 
         metrics = QHBoxLayout()
         metrics.setSpacing(12)
         self.metric_values = {}
-        for key, title, detail in (("files", "FILES ANALYZED", "Images in this run"), ("matched", "MATCHED", "At least one category"), ("ready", "READY TO SORT", "Review before applying"), ("issues", "ISSUES", "Need your attention")):
+        for key, title, detail in (("files", "FILES", "Media in this run"), ("matched", "MATCHED", "At least one category"), ("ready", "INCLUDED", "Ready to apply"), ("issues", "ISSUES", "Need your attention")):
             card = QFrame()
             card.setObjectName("metric")
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(15, 11, 15, 11)
-            card_layout.setSpacing(2)
+            card_layout = QHBoxLayout(card)
+            card_layout.setContentsMargins(14, 8, 14, 8)
+            card_layout.setSpacing(8)
             title_label = _label(title, "eyebrow")
             card_layout.addWidget(title_label)
             value = _label("0", "metricValue")
+            value.setStyleSheet("font-size: 22px; font-weight: 600; background: transparent;")
             if key == "issues":
                 value.setStyleSheet("color: #aaa6aa; font-size: 29px; font-weight: 600;")
             card_layout.addWidget(value)
             detail_label = _label(detail, "muted")
             detail_label.setStyleSheet("font-size: 11px; color: #aaa6aa; background: transparent;")
-            card_layout.addWidget(detail_label)
+            detail_label.hide()
+            card.setToolTip(detail)
             self.metric_values[key] = (value, title_label, detail_label)
             metrics.addWidget(card, 1)
         content.addLayout(metrics)
@@ -679,7 +769,7 @@ class MainWindow(QMainWindow):
         tools_row = QHBoxLayout()
         tools_row.setSpacing(10)
         tools_row.setContentsMargins(16, 11, 16, 11)
-        tools_row.addWidget(_label("Results", "section"))
+        tools_row.addWidget(_label("Review", "section"))
         self.results_count = _label("0 files", "muted")
         tools_row.addWidget(self.results_count)
         tools_row.addStretch()
@@ -688,7 +778,7 @@ class MainWindow(QMainWindow):
         self.face_crops_button.clicked.connect(self._open_face_crops)
         tools_row.addWidget(self.face_crops_button)
         self.flight_report_button = QPushButton("Flight Report…")
-        self.flight_report_button.setToolTip("Open interactive HTML cockpit dashboard.")
+        self.flight_report_button.setToolTip("Open a local summary of this run.")
         self.flight_report_button.clicked.connect(self._open_flight_report)
         tools_row.addWidget(self.flight_report_button)
         self.search_edit = QLineEdit()
@@ -697,13 +787,14 @@ class MainWindow(QMainWindow):
         self.search_edit.setMaximumWidth(270)
         self.search_edit.setAccessibleName("Search results")
         self.filter_combo = QComboBox()
-        for label, value in (("All files", "all"), ("Matched", "matched"), ("Unmatched", "unmatched"), ("Issues", "issues")):
+        for label, value in (("All files", "all"), ("Included", "included"), ("Skipped", "excluded"), ("Matched", "matched"), ("Unmatched", "unmatched"), ("Issues", "issues")):
             self.filter_combo.addItem(label, value)
         self.filter_combo.setMinimumWidth(120)
         tools_row.addWidget(self.search_edit)
         tools_row.addWidget(self.filter_combo)
         results_layout.addLayout(tools_row)
         self.model = ResultsModel(self)
+        self.model.review_requested.connect(self._review_one)
         self.proxy = ResultsFilter(self)
         self.proxy.setSourceModel(self.model)
         self.table = QTableView()
@@ -711,31 +802,90 @@ class MainWindow(QMainWindow):
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().hide()
-        self.table.verticalHeader().setDefaultSectionSize(41)
+        self.table.verticalHeader().setDefaultSectionSize(38)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(2, 110)
-        self.table.setColumnWidth(3, 140)
-        self.table.setMinimumHeight(120)
+        self.table.setColumnWidth(2, 100)
+        self.table.setColumnWidth(3, 145)
+        self.table.setMinimumHeight(160)
         self.table.setSortingEnabled(True)
         self.table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.table.selectionModel().selectionChanged.connect(self._show_selection)
-        results_layout.addWidget(self.table, 1)
+        review_actions = QHBoxLayout()
+        review_actions.setContentsMargins(14, 0, 14, 8)
+        self.include_button = QPushButton("Include selected")
+        self.include_button.clicked.connect(lambda: self._set_selected_included(True))
+        self.exclude_button = QPushButton("Skip selected")
+        self.exclude_button.clicked.connect(lambda: self._set_selected_included(False))
+        self.edit_categories_button = QPushButton("Edit categories…")
+        self.edit_categories_button.clicked.connect(self._edit_categories)
+        for button in (self.include_button, self.exclude_button, self.edit_categories_button):
+            button.setStyleSheet("padding: 6px 10px; font-size: 11px;")
+            review_actions.addWidget(button)
+        review_actions.addStretch()
+        review_actions.addWidget(_label("Space: preview  ·  Esc: hide", "muted"))
+        results_layout.addLayout(review_actions)
+        review_body = QHBoxLayout()
+        review_body.setSpacing(0)
+        review_body.addWidget(self.table, 1)
+        self.inspector = QFrame()
+        self.inspector.setObjectName("inspector")
+        self.inspector.setMinimumWidth(280)
+        self.inspector.setStyleSheet("QFrame#inspector { background: #17171c; border-left: 1px solid #49464a; }")
+        inspect_layout = QVBoxLayout(self.inspector)
+        inspect_layout.setContentsMargins(14, 12, 14, 12)
+        inspect_layout.setSpacing(9)
+        inspect_layout.addWidget(_label("INSPECT", "eyebrow"))
+        self.inspector_name = _label("Select a file", "section")
+        self.inspector_name.setWordWrap(True)
+        inspect_layout.addWidget(self.inspector_name)
+        self.preview_button = QPushButton("Show preview · Space")
+        self.preview_button.setCheckable(True)
+        self.preview_button.clicked.connect(self._preview_toggled)
+        inspect_layout.addWidget(self.preview_button)
+        self.preview_image = _label("")
+        self.preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_image.setFixedHeight(180)
+        self.preview_image.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.preview_image.hide()
+        inspect_layout.addWidget(self.preview_image)
+        self.preview_hint = _label("Previews stay hidden until you open one.", "muted")
+        self.preview_hint.setWordWrap(True)
+        inspect_layout.addWidget(self.preview_hint)
+        self.inspector_metadata = _label("File details and model matches appear here.", "muted")
+        self.inspector_metadata.setWordWrap(True)
+        inspect_layout.addWidget(self.inspector_metadata)
+        self.inspector_matches = _label("", "muted")
+        self.inspector_matches.setWordWrap(True)
+        inspect_layout.addWidget(self.inspector_matches)
+        inspect_layout.addStretch()
+        inspector_scroll = QScrollArea()
+        inspector_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inspector_scroll.setWidgetResizable(True)
+        inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inspector_scroll.setFixedWidth(314)
+        inspector_scroll.setWidget(self.inspector)
+        review_body.addWidget(inspector_scroll)
+        results_layout.addLayout(review_body, 1)
         self.empty_hint = _label("Choose your folders, then analyze to preview the sorting plan.", "muted")
         self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_hint.setContentsMargins(12, 8, 12, 8)
         results_layout.addWidget(self.empty_hint)
-        self.selection_detail = _label("Filenames and detection details only · no image previews", "muted")
+        self.selection_detail = _label("Select files to inspect or change what will be included.", "muted")
         self.selection_detail.setContentsMargins(16, 9, 16, 10)
         self.selection_detail.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.selection_detail.setTextFormat(Qt.TextFormat.PlainText)
         self.selection_detail.setMaximumHeight(55)
         results_layout.addWidget(self.selection_detail)
+        self.scope_label = _label("No files included yet.", "muted")
+        self.scope_label.setWordWrap(True)
+        self.scope_label.setContentsMargins(16, 0, 16, 10)
+        results_layout.addWidget(self.scope_label)
         content.addWidget(results_card, 1)
 
         footer = QWidget()
@@ -768,7 +918,7 @@ class MainWindow(QMainWindow):
         actions.addStretch()
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self._cancel)
-        self.analyze_button = QPushButton("Analyze images")
+        self.analyze_button = QPushButton("Analyze media")
         self.analyze_button.setObjectName("primary")
         self.analyze_button.clicked.connect(self._analyze)
         self.apply_button = QPushButton("Apply sorting")
@@ -816,9 +966,14 @@ class MainWindow(QMainWindow):
         )
 
     def _browse(self, edit: QLineEdit, title: str):
-        directory = QFileDialog.getExistingDirectory(self, title, edit.text().strip('"') or str(Path.home()))
+        directory = QFileDialog.getExistingDirectory(self, title, edit.text().strip('"') or str(Path.home()),
+                                                    options=QFileDialog.Option.DontUseNativeDialog)
         if directory:
             edit.setText(directory)
+
+    def _toggle_setup(self, checked):
+        self.setup_contents.setVisible(checked)
+        self.setup_toggle.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
 
     def _toggle_categories(self, checked: bool):
         self.category_area.setVisible(checked)
@@ -844,11 +999,16 @@ class MainWindow(QMainWindow):
 
     def _refresh_actions(self):
         self.options_card.setEnabled(not self._busy)
+        self.model.review_enabled = not self._busy and self._plan_valid
         paths_set = bool(self.source_edit.text().strip() and self.destination_edit.text().strip())
         categories_selected = not self._categories or any(checkbox.isChecked() for checkbox in self._categories.values())
         self.analyze_button.setEnabled(not self._busy and paths_set and categories_selected)
         self.apply_button.setEnabled(not self._busy and self._plan_valid and self.report is not None and any(_actionable(r) for r in self.report.results))
-        self.apply_button.setText("Resume sorting" if self._phase == "execute" and self._plan_valid else "Apply sorting")
+        count = sum(_actionable(r) for r in self.report.results) if self.report else 0
+        operation = self.report.options.operation if self.report else self.operation_combo.currentData()
+        verb = {"copy": "Copy", "move": "Move", "hardlink": "Link"}.get(operation, "Apply")
+        self.apply_button.setText(f"{verb} {count:,} included")
+        self.apply_button.setToolTip("Applies to all included, actionable files in this run. Search and filters do not change the included set.")
         self.cancel_button.setEnabled(self._busy and self._worker is not None and not self._worker.cancel.is_set())
         self.export_button.setEnabled(not self._busy and self.report is not None)
         self.open_run_button.setEnabled(not self._busy)
@@ -857,6 +1017,90 @@ class MainWindow(QMainWindow):
         self.flight_report_button.setEnabled(not self._busy and self.report is not None and bool(self.report.results))
         self.pmv_forge_button.setEnabled(not self._busy)
         self.harvester_button.setEnabled(not self._busy)
+        selected = self._selected_results()
+        editable = not self._busy and self._plan_valid and any(_reviewable(result) for result in selected)
+        self.include_button.setEnabled(editable)
+        self.exclude_button.setEnabled(editable)
+        self.edit_categories_button.setEnabled(editable)
+        self.preview_button.setEnabled(bool(selected) and not self._privacy_active)
+
+    def _selected_results(self):
+        return [self.proxy.data(index, Qt.ItemDataRole.UserRole) for index in self.table.selectionModel().selectedRows()]
+
+    def _review_one(self, result, included):
+        self._set_included([result], included)
+
+    def _set_selected_included(self, included):
+        self._set_included(self._selected_results(), included)
+
+    def _set_included(self, results, included):
+        if self._busy or not self._plan_valid or self.report is None:
+            return
+        changes = [(result, result.included) for result in results if _reviewable(result) and result.included != included]
+        if not changes:
+            return
+        for result, _ in changes:
+            result.included = included
+        try:
+            self._save_review()
+        except Exception as error:
+            for result, previous in changes:
+                result.included = previous
+            QMessageBox.warning(self, "Review choices could not be saved", str(error))
+        self._review_updated()
+
+    def _save_review(self):
+        if self._engine is None:
+            from .engine import SorterEngine
+            self._engine = SorterEngine(DATA_DIR, detector_factory=lambda: None)
+        self._engine.save_review(self.report)
+
+    def _review_updated(self):
+        if self.model.results:
+            self.model.dataChanged.emit(self.model.index(0, 0), self.model.index(len(self.model.results) - 1, 3))
+        self.proxy.invalidateFilter()
+        self._update_metrics()
+        self._show_selection()
+
+    def _edit_categories(self):
+        rows = [result for result in self._selected_results() if _reviewable(result)]
+        if not rows or self._busy or not self._plan_valid:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit categories — Love Sensation")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(_label(f"Replace categories for {len(rows)} selected file(s). Model detections are retained."))
+        grid = QGridLayout()
+        common = set(rows[0].categories)
+        for row in rows[1:]:
+            common.intersection_update(row.categories)
+        boxes = {}
+        for index, name in enumerate(self._categories):
+            box = QCheckBox(_readable(name))
+            box.setChecked(name in common)
+            grid.addWidget(box, index // 3, index % 3)
+            boxes[name] = box
+        layout.addLayout(grid)
+        layout.addWidget(_label("With no categories selected, files go to Unmatched.", "muted"))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        categories = [name for name, box in boxes.items() if box.isChecked()] or ["_Unmatched"]
+        before = [(row, list(row.categories), copy.deepcopy(row.original_categories)) for row in rows]
+        for row in rows:
+            if row.original_categories is None:
+                row.original_categories = list(row.categories)
+            row.categories = list(categories)
+        try:
+            self._save_review()
+        except Exception as error:
+            for row, previous, original in before:
+                row.categories, row.original_categories = previous, original
+            QMessageBox.warning(self, "Category edits could not be saved", str(error))
+        self._review_updated()
 
     def _analyze(self):
         options = self._options()
@@ -867,6 +1111,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Select a category", "Select at least one category, or select every category to include all matches.")
             return
         self.report = None
+        self._hide_preview()
         self._plan_valid = False
         self._face_crops_valid = False
         self.model.replace([])
@@ -874,7 +1119,7 @@ class MainWindow(QMainWindow):
         self._start_task("analyze", options)
 
     def _apply(self):
-        if self.report is None or not self._plan_valid:
+        if self.report is None or not self._plan_valid or not any(_actionable(r) for r in self.report.results):
             return
         self._plan_valid = False
         self._start_task("execute", self.report.options)
@@ -916,7 +1161,7 @@ class MainWindow(QMainWindow):
                     hours, remainder = divmod(remaining, 3600)
                     minutes, seconds = divmod(remainder, 60)
                     estimate = f"{hours}h {minutes}m" if hours else f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
-                    self.progress_label.setText(f"{completed:,} / {total:,} · {rate:.2f} images/s · ~{estimate} left")
+                    self.progress_label.setText(f"{completed:,} / {total:,} · {rate:.2f} files/s · ~{estimate} left")
                     self.progress_label.setToolTip("Average since analysis started, including file reads and model preparation. Time remaining is an estimate.")
             else:
                 self.progress.setRange(0, 0)
@@ -946,10 +1191,13 @@ class MainWindow(QMainWindow):
             self._restore_options(report.options)
             self._phase = "execute" if getattr(report, "phase", "analyze") == "execute" else "analyze"
         self.report = report
+        self._hide_preview()
+        if report.results:
+            self.setup_toggle.setChecked(False)
         self._face_crops_valid = bool(getattr(report, "analysis_complete", False))
         self.model.replace(report.results)
         self._show_device(report.device)
-        self._plan_valid = (self._phase == "analyze" and not report.cancelled and getattr(report, "analysis_complete", False)) or (self._phase == "execute" and any(_actionable(result) for result in report.results))
+        self._plan_valid = (self._phase == "analyze" and not report.cancelled and getattr(report, "analysis_complete", False)) or (self._phase == "execute" and any(_actionable(result) or _reviewable(result) for result in report.results))
         issues = sum(_has_error(result) for result in report.results)
         total = len(report.results)
         if report.cancelled:
@@ -1009,32 +1257,60 @@ class MainWindow(QMainWindow):
         results = self.model.results
         issues = sum(_has_error(result) for result in results)
         matched = sum(_matched(result) for result in results)
-        ready = sum(result.status == "ready" and not _has_error(result) for result in results)
+        ready = sum(_actionable(result) for result in results)
         applied = sum(result.status in {"copied", "moved"} and not _has_error(result) for result in results)
         showing_applied = self._phase == "execute"
         values = {"files": len(results), "matched": matched, "ready": applied if showing_applied else ready, "issues": issues}
         for key, value in values.items():
             self.metric_values[key][0].setText(f"{value:,}")
-        self.metric_values["ready"][1].setText("SORTED" if showing_applied else "READY TO SORT")
+        self.metric_values["ready"][1].setText("SORTED" if showing_applied else "INCLUDED")
         self.metric_values["ready"][2].setText("Files with saved destinations" if showing_applied else "Review before applying")
-        self.metric_values["issues"][0].setStyleSheet(f"color: {'#e69b9c' if issues else '#aaa6aa'}; font-size: 29px; font-weight: 600;")
+        self.metric_values["issues"][0].setStyleSheet(f"color: {'#e69b9c' if issues else '#aaa6aa'}; font-size: 22px; font-weight: 600;")
         visible = self.proxy.rowCount()
         self.results_count.setText(f"{visible:,} of {len(results):,} files" if visible != len(results) else f"{len(results):,} files")
+        skipped = sum(not result.included for result in results)
+        self.scope_label.setText(f"{ready:,} included and ready · {skipped:,} skipped. Apply uses the full included set, regardless of search or filter.")
         self.empty_hint.setVisible(not results)
         self.empty_hint.setText("Analysis is running. Results will appear here." if self._busy else "Choose your folders, then analyze to preview the sorting plan.")
         for index, label in enumerate(self.step_labels):
             active = (0 if self._busy and self._phase == "analyze" else 2 if self._phase == "execute" else 1 if results else 0)
             label.setStyleSheet(f"color: {'#e0c58f' if index == active else '#aaa6aa'}; background: transparent;")
+        self._refresh_actions()
 
     def _filter_results(self, *_):
         self.proxy.update_filter(self.search_edit.text(), self.filter_combo.currentData())
         self._update_metrics()
 
     def _show_selection(self, *_):
-        rows = self.table.selectionModel().selectedRows()
+        rows = self._selected_results()
+        self._refresh_actions()
         if not rows:
+            self.inspector_name.setText("Select a file")
+            self.inspector_metadata.setText("File details and model matches appear here.")
+            self.inspector_matches.clear()
+            self.selection_detail.setText("Select files to inspect or change what will be included.")
+            self._hide_preview()
             return
-        result = self.proxy.data(rows[0], Qt.ItemDataRole.UserRole)
+        result = rows[0]
+        self.inspector_name.setText(Path(result.source).name)
+        details = [f"{result.media_type.title()} · {result.size / 1048576:.1f} MB"]
+        if result.width and result.height:
+            details.append(f"{result.width} × {result.height}")
+        if result.duration_s:
+            details.append(f"{result.duration_s:.1f}s · {result.fps:g} fps")
+        if result.media_type == "video":
+            details.append(f"Sampled {result.sampled_frames} frames · {result.failed_frames} failed")
+        if result.original_categories is not None:
+            details.append("Categories edited by you")
+        if len(rows) > 1:
+            details.append(f"{len(rows)} files selected; inspecting the first")
+        self.inspector_metadata.setText("\n".join(details))
+        matches = sorted(result.detections, key=lambda item: float(item.get("score", 0)), reverse=True)[:4]
+        threshold = self.report.options.threshold if self.report else self.confidence_spin.value()
+        lines = [f"Model matches · threshold {threshold:.0%}"]
+        lines.extend(f"{_readable(item.get('class', ''))}: {float(item.get('score', 0)):.0%}" for item in matches)
+        lines.append("Filed as: " + (", ".join(_readable(c) for c in result.categories) or "No category"))
+        self.inspector_matches.setText("\n".join(lines))
         text = result.source
         if result.error:
             text += f"  |  {result.error}"
@@ -1042,6 +1318,74 @@ class MainWindow(QMainWindow):
             text += "  →  " + "; ".join(result.destinations)
         self.selection_detail.setText(text)
         self.selection_detail.setToolTip(text)
+        if self.preview_button.isChecked():
+            self._request_preview(result)
+
+    def _preview_selected(self):
+        if self.preview_button.isEnabled():
+            self.preview_button.click()
+
+    def _preview_toggled(self, checked):
+        selected = self._selected_results()
+        if checked and selected and not self._privacy_active:
+            self._request_preview(selected[0])
+        else:
+            self._hide_preview()
+
+    def _hide_preview(self):
+        self._preview_generation += 1
+        if self._preview_worker is not None:
+            self._preview_worker.cancel_event.set()
+        self._preview_pending = None
+        self.preview_button.setChecked(False)
+        self.preview_button.setText("Show preview · Space")
+        self.preview_image.clear()
+        self.preview_image.hide()
+        self.preview_hint.setText("Previews stay hidden until you open one.")
+
+    def _request_preview(self, result):
+        self._preview_generation += 1
+        if self._preview_worker is not None:
+            self._preview_worker.cancel_event.set()
+        self.preview_button.setText("Hide preview · Space")
+        self.preview_image.clear()
+        self.preview_image.show()
+        self.preview_hint.setText("Loading preview…")
+        self._preview_pending = (self._preview_generation, result)
+        self._start_preview_worker()
+
+    def _start_preview_worker(self):
+        if self._preview_worker is not None or self._preview_pending is None:
+            return
+        generation, result = self._preview_pending
+        self._preview_pending = None
+        self._preview_worker = ReviewPreviewWorker(generation, result, self)
+        self._preview_worker.ready.connect(self._preview_ready)
+        self._preview_worker.finished.connect(self._preview_finished)
+        self._preview_worker.start()
+
+    def _preview_ready(self, generation, value):
+        if generation != self._preview_generation or self._privacy_active or not self.preview_button.isChecked():
+            return
+        if value.get("error"):
+            self.preview_hint.setText(value["error"])
+            self.preview_image.hide()
+            return
+        pixmap = QPixmap()
+        pixmap.loadFromData(value["png"], "PNG")
+        self.preview_image.setPixmap(pixmap)
+        info = value.get("info", {})
+        detail = f"Frame at {info['timestamp_s']:.2f}s · " if "timestamp_s" in info else ""
+        self.preview_hint.setText(detail + ("GPU preview" if info.get("cuda_verified") else "CPU preview"))
+
+    def _preview_finished(self):
+        worker, self._preview_worker = self._preview_worker, None
+        if worker is not None:
+            worker.deleteLater()
+        if self._close_requested:
+            QTimer.singleShot(0, self.close)
+        elif not self._privacy_active and self.preview_button.isChecked():
+            self._start_preview_worker()
 
     def _open_output(self):
         destination = Path(self.destination_edit.text().strip().strip('"'))
@@ -1058,9 +1402,18 @@ class MainWindow(QMainWindow):
         clips = []
         if self.report and self.report.results:
             for r in self.report.results:
+                if not r.included or _has_error(r):
+                    continue
                 if getattr(r, "media_type", "still") == "video" or r.source.lower().endswith((".mp4", ".mov", ".mkv", ".webm")):
+                    from .review_preview import surviving_path
+                    try:
+                        path = str(surviving_path(r))
+                    except FileNotFoundError:
+                        continue
                     clips.append({
-                        "path": r.source,
+                        "path": path,
+                        "source": path,
+                        "media_type": "video",
                         "duration_s": getattr(r, "duration_s", 5.0) or 5.0,
                         "prominence": getattr(r, "prominence", 0.5) or 0.5,
                         "sustained_wow": getattr(r, "sustained_wow", 0.0) or 0.0,
@@ -1074,7 +1427,11 @@ class MainWindow(QMainWindow):
     def _open_harvester(self):
         from .harvester_dialog import CompHarvesterDialog
         dialog = CompHarvesterDialog(parent=self)
-        dialog.exec()
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.harvested_takes:
+            folder = Path(dialog.harvested_takes[0]).parent
+            self.source_edit.setText(str(folder))
+            self.setup_toggle.setChecked(True)
+            self.status_label.setText(f"{len(dialog.harvested_takes)} extracted clips are ready. Choose an output folder and Analyze media to review them.")
 
     def _open_flight_report(self):
         if not self.report or not self.report.results:
@@ -1083,32 +1440,58 @@ class MainWindow(QMainWindow):
         from .flight_report import generate_flight_report
         report_dir = DATA_DIR / "runs"
         report_dir.mkdir(parents=True, exist_ok=True)
-        report_path = report_dir / f"flight_report_{self.report.run_id[:8]}.html"
+        safe_run_id = re.sub(r"[^A-Za-z0-9_-]", "_", self.report.run_id) or "run"
+        report_path = report_dir / f"flight_report_{safe_run_id}.html"
         results_dicts = [r.__dict__ if hasattr(r, "__dict__") else r for r in self.report.results]
         generate_flight_report("Love Sensation — Flight Report", report_path, results_dicts)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(report_path)))
 
     def _toggle_stealth_loupe(self):
-        rows = self.table.selectionModel().selectedRows()
-        if not rows:
-            return
-        result = self.proxy.data(rows[0], Qt.ItemDataRole.UserRole)
-        if not result:
-            return
-        if self._loupe is None:
-            self._loupe = StealthLoupe(self)
-        if self._loupe.isVisible() and getattr(self._loupe, "_current_source", None) == result.source:
-            self._loupe.hide()
-            return
-        self._loupe._current_source = result.source
-        self._loupe.show_for(result)
+        self._preview_selected()
+
+    def _set_privacy(self, hidden):
+        self._privacy_active = bool(hidden)
+        if hidden:
+            from PySide6.QtWidgets import QToolTip
+            QToolTip.hideText()
+            self._hide_preview()
+            if self._loupe is not None:
+                self._loupe.hide()
+            self.workspace_stack.setCurrentWidget(self.privacy_page)
+            self.setWindowTitle("Love Sensation — Workspace hidden")
+            self._dialog_masks.mask_visible()
+        else:
+            self._dialog_masks.restore()
+            self.workspace_stack.setCurrentIndex(0)
+            self.setWindowTitle(f"Love Sensation {__version__} — Private media workstation")
+        self._refresh_actions()
+
+    def eventFilter(self, watched, event):
+        from .privacy import belongs_to
+        if isinstance(watched, QWidget) and belongs_to(watched, self):
+            if event.type() == QEvent.Type.Resize and self._privacy_active:
+                self._dialog_masks.resized(watched)
+            if event.type() == QEvent.Type.WindowTitleChange and self._privacy_active:
+                self._dialog_masks.title_changed(watched)
+            if event.type() == QEvent.Type.Show and self._privacy_active:
+                self._dialog_masks.on_show(watched)
+            if event.type() in {QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress}:
+                if event.key() == Qt.Key.Key_Escape:
+                    if event.type() == QEvent.Type.KeyPress:
+                        self._set_privacy(True)
+                    event.accept()
+                    return True
+                if (event.key() == Qt.Key.Key_Space and not self._privacy_active
+                        and (watched is self.table or belongs_to(watched, self.table))):
+                    if event.type() == QEvent.Type.KeyPress:
+                        self._preview_selected()
+                    event.accept()
+                    return True
+        return super().eventFilter(watched, event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
-            self.table.clearSelection()
-            self.selection_detail.setText("Privacy shield active • Press Space on any row to inspect")
-            if self._loupe:
-                self._loupe.hide()
+            self._set_privacy(True)
             return
         elif event.key() == Qt.Key.Key_Space:
             self._toggle_stealth_loupe()
@@ -1116,7 +1499,8 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def _open_run(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open a saved run", str(DATA_DIR / "runs"), "Saved run (*.json)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open a saved run", str(DATA_DIR / "runs"), "Saved run (*.json)",
+                                           options=QFileDialog.Option.DontUseNativeDialog)
         if path:
             self._plan_valid = False
             self._face_crops_valid = False
@@ -1153,7 +1537,8 @@ class MainWindow(QMainWindow):
     def _export_report(self):
         if self.report is None:
             return
-        path, selected_filter = QFileDialog.getSaveFileName(self, "Export run report", str(DATA_DIR / f"report-{self.report.run_id}.json"), "JSON report (*.json);;CSV report (*.csv)")
+        path, selected_filter = QFileDialog.getSaveFileName(self, "Export run report", str(DATA_DIR / f"report-{self.report.run_id}.json"), "JSON report (*.json);;CSV report (*.csv)",
+                                                          options=QFileDialog.Option.DontUseNativeDialog)
         if not path:
             return
         wanted_suffix = ".csv" if selected_filter.startswith("CSV") else ".json"
@@ -1199,12 +1584,18 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._save_settings()
+        self._hide_preview()
+        if self._preview_worker is not None and self._preview_worker.isRunning():
+            self._close_requested = True
+            event.ignore()
+            return
         if self._worker is not None and self._worker.isRunning():
             self._close_requested = True
             self._cancel()
             self.status_label.setText("Finishing the current operation safely, then closing…")
             event.ignore()
             return
+        QApplication.instance().removeEventFilter(self)
         event.accept()
 
 

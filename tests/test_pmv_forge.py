@@ -2,20 +2,32 @@ import tempfile
 import unittest
 from pathlib import Path
 import xml.etree.ElementTree as ET
+from unittest.mock import patch
+from fractions import Fraction
 
-from platinum_sorter.pmv_forge import assemble_pmv_timeline, export_fcp7_xml, CutSlice
+from platinum_sorter.pmv_forge import assemble_pmv_timeline, export_fcp7_xml, CutSlice, frame_rate
 
 
 class PmvForgeTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(prefix="test_pmv_forge_")
         self.dir_path = Path(self.temp_dir.name)
+        # XML unit tests use known source metadata; separate video-engine tests
+        # exercise real FFmpeg probing/cutting with an NVENC-first fixture.
+        self.probe_patch = patch('platinum_sorter.pmv_forge.probe_media_file', return_value={
+            'duration_s': 16., 'has_audio': True, 'audio_channels': 2, 'audio_sample_rate': 48000})
+        self.candidate_patch = patch('platinum_sorter.pmv_forge.prepare_candidate_clips',
+            side_effect=lambda clips: [{**c, 'duration_s':16., 'fps':30., 'fps_ratio':'30/1', 'width':320,'height':240} for c in clips])
+        self.probe_patch.start()
+        self.candidate_patch.start()
+        self.addCleanup(self.probe_patch.stop)
+        self.addCleanup(self.candidate_patch.stop)
 
         self.audio_grid = {
             "bpm": 120.0,
             "beat_period": 0.5,
             "first_beat_s": 0.0,
-            "total_duration_s": 8.0,
+            "total_duration_s": 12.0,
             "beats": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5],
             "bars": [0.0, 2.0, 4.0, 6.0, 8.0, 10.0],
             "drop_bars": [4],  # Bar 4 is drop -> bar 3 is predrop (fill)
@@ -83,7 +95,9 @@ class PmvForgeTests(unittest.TestCase):
             start = int(item.find("start").text)
             end = int(item.find("end").text)
             dur = int(item.find("duration").text)
-            self.assertEqual(end - start, dur)
+            # xmeml clip duration describes full source length, not the trim.
+            self.assertGreaterEqual(dur,int(item.find('out').text))
+            self.assertGreater(end,start)
             if prev_end is not None:
                 # Gapless continuity: each cut must begin exactly where the previous cut ended
                 self.assertEqual(start, prev_end, f"Frame gap or overlap detected between cuts: prev end {prev_end}, next start {start}")
@@ -248,6 +262,128 @@ class PmvForgeTests(unittest.TestCase):
 
         empty_clips_cuts = assemble_pmv_timeline(self.audio_grid, [])
         self.assertEqual(empty_clips_cuts, [])
+
+    def test_integer_and_ntsc_rates_are_distinct(self):
+        audio=self.dir_path/'song.wav'; audio.write_bytes(b'unit metadata mocked')
+        cuts=assemble_pmv_timeline(self.audio_grid,self.clips)
+        for fps in (24, 25, 30, 60):
+            self.assertEqual(frame_rate(fps), (Fraction(fps), fps, 'FALSE'))
+            tree=ET.parse(export_fcp7_xml(cuts,audio,self.dir_path/f'rate-{fps}.xml',fps=fps))
+            self.assertEqual(tree.findtext('.//sequence/rate/ntsc'),'FALSE')
+        self.assertEqual(frame_rate(29.97), (Fraction(30000,1001),30,'TRUE'))
+        self.assertEqual(frame_rate('24000/1001'), (Fraction(24000,1001),24,'TRUE'))
+
+    def test_short_sources_and_partial_last_bar_stay_in_bounds(self):
+        grid={**self.audio_grid,'total_duration_s':5.2,'bars':[0,2,4],'beats':[0,.5,1], 'drop_bars':[], 'breakdown_bars':[]}
+        cuts=assemble_pmv_timeline(grid,[{'path':'short.mp4','duration_s':1}],chaos=0)
+        self.assertAlmostEqual(cuts[-1].timeline_end_s,5.2)
+        self.assertAlmostEqual(sum(c.duration_s for c in cuts),5.2)
+        for left,right in zip(cuts,cuts[1:]): self.assertAlmostEqual(left.timeline_end_s,right.timeline_start_s)
+        for cut in cuts:
+            self.assertGreaterEqual(cut.clip_in_s,0)
+            self.assertLessEqual(cut.clip_out_s,1)
+
+    def test_fill_offsets_and_handles_stay_in_source(self):
+        cuts=assemble_pmv_timeline(self.audio_grid,[{'path':'short.mp4','duration_s':.8}],chaos=1)
+        for c in cuts:
+            self.assertLessEqual(c.clip_out_s+c.handle_out_s,.800001)
+            self.assertGreaterEqual(c.clip_in_s-c.handle_in_s,-.000001)
+
+    def test_repeated_short_sources_do_not_leave_subframe_slivers(self):
+        grid={**self.audio_grid,'total_duration_s':5.27,'bars':[0,2.42,4.84],'drop_bars':[], 'breakdown_bars':[]}
+        rate=float(Fraction(30000,1001))
+        cuts=assemble_pmv_timeline(grid,[{'path':'short.mp4','duration_s':.8}],chaos=0,fps=29.97)
+        self.assertLessEqual(cuts[-1].timeline_end_s,5.27)
+        for c in cuts:
+            self.assertGreaterEqual(c.duration_s*rate,.999999)
+            self.assertAlmostEqual(c.timeline_start_s*rate,round(c.timeline_start_s*rate))
+            self.assertLessEqual(c.clip_out_s,.800001)
+
+    def test_missing_audio_and_invalid_ranges_rejected(self):
+        cuts=assemble_pmv_timeline(self.audio_grid,self.clips)
+        with self.assertRaisesRegex(ValueError,'soundtrack'):
+            export_fcp7_xml(cuts,self.dir_path/'missing.wav',self.dir_path/'missing.xml')
+        audio=self.dir_path/'song.wav'; audio.write_bytes(b'unit metadata mocked')
+        cuts[0].clip_out_s=99
+        with self.assertRaisesRegex(ValueError,'outside source'):
+            export_fcp7_xml(cuts,audio,self.dir_path/'bad.xml')
+
+    def test_mono_audio_uses_probed_sample_rate(self):
+        cuts=assemble_pmv_timeline(self.audio_grid,self.clips)
+        audio=self.dir_path/'song.wav'; audio.write_bytes(b'unit metadata mocked')
+        with patch('platinum_sorter.pmv_forge.probe_media_file',return_value={
+            'duration_s':16.,'has_audio':True,'audio_channels':1,'audio_sample_rate':44100}):
+            p=export_fcp7_xml(cuts,audio,self.dir_path/'mono.xml')
+        tree=ET.parse(p)
+        self.assertEqual(len(tree.findall('.//sequence/media/audio/track')),1)
+        self.assertEqual(tree.findtext('.//audio/samplecharacteristics/samplerate'),'44100')
+
+    def test_unreliable_grid_does_not_assemble(self):
+        self.assertEqual(assemble_pmv_timeline({**self.audio_grid,'reliable':False},self.clips),[])
+
+
+class PmvDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
+        try:
+            from PySide6.QtWidgets import QApplication
+        except ImportError:
+            raise unittest.SkipTest('PySide6 not installed')
+        cls.app=QApplication.instance() or QApplication([])
+
+    def test_constructor_and_music_change_invalidate_grid(self):
+        from platinum_sorter.pmv_dialog import PmvForgeDialog
+        with tempfile.TemporaryDirectory() as tmp:
+            audio=Path(tmp)/'song.wav'; audio.write_bytes(b'identity-only fixture')
+            dialog=PmvForgeDialog()
+            dialog.audio_edit.setText(str(audio))
+            dialog._pending_identity=dialog._audio_identity()
+            dialog._on_beat_finished({'reliable':True,'bars':[0,2],'bpm':120,'total_duration_s':4})
+            self.assertTrue(dialog.assemble_btn.isEnabled())
+            dialog.bpm_spin.setValue(121)
+            self.assertIsNone(dialog.audio_grid)
+            self.assertFalse(dialog.assemble_btn.isEnabled())
+            dialog.close()
+
+    def test_stale_worker_result_is_discarded(self):
+        from platinum_sorter.pmv_dialog import PmvForgeDialog
+        with tempfile.TemporaryDirectory() as tmp:
+            audio=Path(tmp)/'song.wav'; audio.write_bytes(b'identity-only fixture')
+            other=Path(tmp)/'other.wav'; other.write_bytes(b'other fixture')
+            dialog=PmvForgeDialog(); dialog.audio_edit.setText(str(audio))
+            dialog._pending_identity=dialog._audio_identity()
+            dialog.audio_edit.setText(str(other))
+            dialog._on_beat_finished({'reliable':True,'bars':[0,2],'bpm':120,'total_duration_s':4})
+            self.assertIsNone(dialog.audio_grid)
+            self.assertFalse(dialog.assemble_btn.isEnabled())
+            dialog.close()
+
+    def test_reject_waits_for_actual_worker_completion(self):
+        import threading, time
+        from platinum_sorter.pmv_dialog import PmvForgeDialog
+        gate=threading.Event()
+        def delayed_grid(*args,**kwargs):
+            gate.wait(3)
+            return {'reliable':True,'bars':[0,2],'bpm':120,'total_duration_s':4}
+        with tempfile.TemporaryDirectory() as tmp, patch('platinum_sorter.pmv_dialog.detect_tempo_and_grid',side_effect=delayed_grid):
+            audio=Path(tmp)/'song.wav'; audio.write_bytes(b'identity-only fixture')
+            dialog=PmvForgeDialog(); dialog.audio_edit.setText(str(audio))
+            dialog._start_beat_analysis()
+            try:
+                self.assertFalse(dialog.analyze_beat_btn.isEnabled())
+                dialog.reject()
+                self.assertTrue(dialog._close_when_finished)
+                self.assertIsNotNone(dialog._worker)
+            finally:
+                gate.set()
+                deadline=time.monotonic()+3
+                while dialog._worker is not None and time.monotonic()<deadline:
+                    self.app.processEvents()
+                    time.sleep(.005)
+            self.assertIsNone(dialog._worker)
+            self.assertTrue(dialog.analyze_beat_btn.isEnabled())
 
 
 if __name__ == "__main__":

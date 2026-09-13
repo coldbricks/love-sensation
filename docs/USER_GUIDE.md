@@ -20,7 +20,7 @@ The supported desktop target is Windows 11. Python 3.12–3.14, PyTorch, and tor
 
 ## Choosing a sort
 
-Use separate, non-overlapping source and output folders. The app scans supported image extensions recursively and preserves relative subfolders inside each category.
+Use separate, non-overlapping source and output folders. The app scans supported image and video extensions recursively and preserves relative subfolders inside each category.
 
 - **Best category:** file into the single highest-scoring selected category above the threshold.
 - **Top three categories:** file into up to three unique selected categories.
@@ -33,7 +33,19 @@ Use **Deselect all**, then enable the categories you want. Analyze stays disable
 
 ## Review and apply
 
-Analysis reads source images without creating sorted copies. Search and filter the results before choosing **Apply sorting**. Copy is the default operation. Each image can create more than one full-image output when it matches multiple selected categories.
+Analysis reads source files without creating sorted copies. When it completes, folder setup collapses to leave more room for **Library & Review**. Click **Folders & sorting** to expand it again.
+
+- Select one or several rows. Use **Include selected** or **Skip selected**, or the checkbox beside a ready file. Skipped files keep their analysis and can be included later.
+- **Edit categories…** replaces the categories of selected ready files. Original model detections and original category choices are retained in the saved run. No checked categories means `_Unmatched`.
+- **Space** on the focused results table opens or closes an on-demand preview. The inspector also shows source dimensions, model scores, filing categories and video sample counts. Previews stay in memory and are never written to a thumbnail cache.
+- The action button shows the operation and exact included count, for example **Copy 12 included**. It applies to the full included set, even when search hides some rows. Search and filters only change the view.
+- Review changes are saved with the run. **Open run** restores them. Completed rows cannot be edited or filed a second time; skipped ready rows remain available.
+
+Copy is the default operation. A file can create more than one output when it matches multiple selected categories. A hardlink shares the same writable data with its source: editing either name changes both. Hash verification and cross-volume copy fallback take time and may require additional space.
+
+Press **Escape** or **Hide workspace** to conceal the workspace, previews and owned application dialogs. Background work continues. **Resume workspace** deliberately restores the interface; previews remain closed. This covers this app's Qt windows, not external browsers or editors opened from it.
+
+Video analysis is sampled. **Partial** means some frames failed; **Error** means analysis could not complete. Such videos are not filed as successful unmatched results. A completed sampled scan does not establish that every video frame was inspected.
 
 The progress label reports elapsed analysis throughput and an estimated time remaining. Disk speed, image dimensions, codec, verification, caching, and other applications affect the rate. GPU utilization alone does not measure total sorting throughput.
 
@@ -49,10 +61,11 @@ Crop filenames include a face number and receive a safe suffix on repeat export.
 
 ## PMV Forge & Comp Harvester
 
-- **The PMV Forge:** Open **PMV Forge…** in the sidebar. Drop any audio track (WAV, MP3, FLAC, OGG) to detect its exact BPM, 4-beat bar lines, and drop cues via GPU autocorrelation. Adjust the Chaos Knob (0.0 for steady 1-bar cuts, 0.5 for balanced grooves, 1.0 for rapid-fire stutters) and export an automated Final Cut Pro 7 / Premiere Pro XML sequence with sequence markers (`DROP`, `FILL`, `CHOKE`, `PEAK`).
-- **Comp Harvester:** Open **Comp Harvester…** in the sidebar. Point at compilation videos to perform lossless scene-cut splitting into standalone takes without re-encoding.
-- **Flight Report:** Open **Flight Report…** to view the interactive radar cockpit dashboard with the audio waveform, cut timeline blocks, and clickable media cards.
-- **NTFS Hardlinks:** In the Vault organizer, select **Hardlink** to place files in multiple category folders with zero duplicate disk usage.
+- **PMV Forge:** Browse to a local audio track and analyze an estimated tempo grid. Four beats per bar are assumed; silence does not produce a usable grid. Changing music or requested tempo invalidates the previous result. Included, successfully analyzed video files are supplied from the current run; a folder can also be selected. Source metadata and bounds are checked before XML export. The output is an editing sequence, not a rendered movie. Imported playback in your target editor still needs review.
+- **Comp Harvester:** Choose **Fast copy** for unchanged compressed media with potentially approximate keyframe boundaries, or **Accurate cuts** to re-encode at requested boundaries with GPU encoding when available. Every run uses a separate output subfolder and records measured durations. Long scenes are divided into multiple takes. After extraction, **Open in Library & Review** loads that folder into source setup; choose a separate output and analyze to review it.
+- **Flight Report:** Opens an offline HTML summary with included/skipped state. Each run has a distinct report filename. A report catalog is metadata, not an embedded media player.
+
+BeatEdit marker import and a persistent catalog across multiple runs are not implemented in this release.
 - **Stealth Loupe:** Press `Space` on any selected row to view an instant frosted-glass inspection card with prominence and aspect ratios; press `Esc` to instantly sanitize the UI.
 
 ## File handling and recovery
