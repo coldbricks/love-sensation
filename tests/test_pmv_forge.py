@@ -318,6 +318,25 @@ class PmvForgeTests(unittest.TestCase):
         self.assertEqual(len(tree.findall('.//sequence/media/audio/track')),1)
         self.assertEqual(tree.findtext('.//audio/samplecharacteristics/samplerate'),'44100')
 
+    def test_cancelled_export_stops_between_sources_and_preserves_existing_output(self):
+        import threading
+        cancel = threading.Event()
+        audio = self.dir_path / 'song.wav'
+        audio.write_bytes(b'synthetic metadata fixture')
+        output = self.dir_path / 'existing.xml'
+        output.write_text('previous export', encoding='utf-8')
+        cuts = assemble_pmv_timeline(self.audio_grid, self.clips, chaos=0, seed=7)
+        calls = []
+        def prepare(clips):
+            calls.append(clips)
+            cancel.set()
+            return [{**clip, 'duration_s':16., 'fps':30., 'fps_ratio':'30/1', 'width':320, 'height':240} for clip in clips]
+        with patch('platinum_sorter.pmv_forge.prepare_candidate_clips', side_effect=prepare):
+            with self.assertRaises(InterruptedError):
+                export_fcp7_xml(cuts, audio, output, cancel_event=cancel)
+        self.assertEqual(1, len(calls))
+        self.assertEqual('previous export', output.read_text(encoding='utf-8'))
+
     def test_unreliable_grid_does_not_assemble(self):
         self.assertEqual(assemble_pmv_timeline({**self.audio_grid,'reliable':False},self.clips),[])
 
@@ -341,7 +360,7 @@ class PmvDialogTests(unittest.TestCase):
             dialog.audio_edit.setText(str(audio))
             dialog._pending_identity=dialog._audio_identity()
             dialog._on_beat_finished({'reliable':True,'bars':[0,2],'bpm':120,'total_duration_s':4})
-            self.assertTrue(dialog.assemble_btn.isEnabled())
+            self.assertFalse(dialog.assemble_btn.isEnabled(), 'Footage is required before building a timeline')
             dialog.bpm_spin.setValue(121)
             self.assertIsNone(dialog.audio_grid)
             self.assertFalse(dialog.assemble_btn.isEnabled())

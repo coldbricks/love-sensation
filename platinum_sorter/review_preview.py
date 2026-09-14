@@ -11,6 +11,7 @@ import re
 import threading
 
 from .engine import _Cancelled, _assert_no_links, _hash_stream, _open_regular
+from .evidence import is_accepted_semantic
 from .video_engine import _run_media
 
 PREVIEW_LIMIT = (268, 180)
@@ -178,6 +179,15 @@ def _decode_image(data, torch, device, info):
     return tensor
 
 
+def _preview_timestamp(result) -> float:
+    semantic_match = not getattr(result, "geometry_available", False) and any(
+        is_accepted_semantic(detection, result.categories)
+        for detection in result.detections
+    )
+    field = "best_match_timestamp_s" if semantic_match else "best_timestamp_s"
+    return float(getattr(result, field, 0) or 0)
+
+
 def render_preview(result, cancel_event=None) -> dict:
     """Return PNG bytes and observed device metadata; never write a media cache."""
     if cancel_event is not None and cancel_event.is_set():
@@ -202,7 +212,7 @@ def render_preview(result, cancel_event=None) -> dict:
             source_stream = document["streams"][0]
             display_width, display_height = _video_display_size(source_stream)
             width, height = _fit(display_width, display_height, even=True)
-            timestamp = float(getattr(result, "best_timestamp_s", 0) or 0)
+            timestamp = _preview_timestamp(result)
             if not math.isfinite(timestamp):
                 raise ValueError("Saved video preview timestamp is invalid.")
             duration = 0.0

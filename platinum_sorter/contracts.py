@@ -46,6 +46,8 @@ class ImageResult:
     sustained_wow: float = 0.0
     best_timestamp_s: float = 0.0
     best_box: list[int] = field(default_factory=list)
+    geometry_available: bool = False
+    best_match_timestamp_s: float = 0.0
     included: bool = True
     original_categories: list[str] | None = None
     width: int = 0

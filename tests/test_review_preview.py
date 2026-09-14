@@ -159,6 +159,41 @@ class ReviewPreviewTests(unittest.TestCase):
         self.assertIn("100:180", calls[1][calls[1].index("-vf") + 1])
         self.assertEqual((1440, 576), module._video_display_size({"width": 720, "height": 576, "sample_aspect_ratio": "2:1"}))
 
+    def test_video_preview_uses_accepted_semantic_match_without_inventing_geometry(self):
+        _, result = self.source("semantic.mp4", data=b"synthetic video")
+        result.media_type, result.duration_s = "video", 60.0
+        result.best_timestamp_s, result.best_match_timestamp_s = 7.0, 42.0
+        result.categories = ["BUTTOCKS_COVERED"]
+        result.detections = [{"class": "BUTTOCKS_COVERED", "source": "siglip2",
+                              "scope": "image", "score_kind": "logit_margin",
+                              "raw_margin": 3.25, "box": [], "accepted": True}]
+        metadata = {"streams": [{"width": 24, "height": 16}], "format": {"duration": "60.0"}}
+        cases = [
+            (False, ["BUTTOCKS_COVERED"], 3.25, 42.0),
+            (True, ["BUTTOCKS_COVERED"], 3.25, 7.0),
+            (False, ["FACE_FEMALE"], 3.25, 7.0),
+            (False, ["BUTTOCKS_COVERED"], 0.0, 7.0),
+            (False, ["BUTTOCKS_COVERED"], -1.0, 7.0),
+        ]
+        for geometry, categories, margin, expected in cases:
+            with self.subTest(geometry=geometry, categories=categories, margin=margin):
+                result.geometry_available, result.categories = geometry, categories
+                result.detections[0]["raw_margin"] = margin
+                calls = []
+
+                def run(command, **kwargs):
+                    calls.append(command)
+                    value = json.dumps(metadata).encode() if command[0] == "ffprobe" else png_bytes()
+                    return subprocess.CompletedProcess(command, 0, value, b"")
+
+                with patch.object(module, "_run_media", side_effect=run):
+                    preview = module.render_preview(result)
+                self.assertEqual(expected, preview["info"]["timestamp_s"])
+                self.assertEqual(str(expected), calls[1][calls[1].index("-ss") + 1])
+                self.assertEqual([], result.detections[0]["box"])
+                self.assertNotIn("score", result.detections[0])
+                self.assertEqual(geometry, result.geometry_available)
+
     def test_unexpected_cuda_failure_is_not_retried_on_cpu(self):
         _, result = self.source("source.jpg")
         with patch("torch.cuda.is_available", return_value=True), patch("torch.cuda.get_device_name", return_value="test CUDA"), \

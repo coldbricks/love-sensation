@@ -18,6 +18,22 @@ Use `-SkipDiagnose` to finish dependency setup without downloading and verifying
 
 The supported desktop target is Windows 11. Python 3.12–3.14, PyTorch, and torchvision must be 64-bit. The default setup uses the CUDA 12.8 package channel. Keep your NVIDIA driver compatible with that runtime. The app selects CPU processing if CUDA is unavailable and displays that choice.
 
+## Create a music video
+
+The app opens in **Create music video**. You can work directly from a video folder; a detection or sorting run is not required.
+
+1. **Your footage:** click **Choose footage folder…**. The folder loads immediately. **Include subfolders** controls recursive loading; **Load clips** reloads a typed path or an updated folder. The clip count, combined duration, and skipped-file count appear below it. Hover over the count for reasons files were skipped. The source files remain in place.
+2. **Your music:** choose a soundtrack, then **Analyze Track**. Use the BPM override when needed; changing it requires reanalysis.
+3. **Edit settings:** choose pacing with Chaos, an edit seed, and the timeline frame rate.
+4. **Build timeline:** review the ordered cuts, their timeline positions, source filenames, source in-points, and durations. Changing footage, music, or edit settings clears the old preview so it cannot be exported accidentally.
+5. **Export XML…:** save the exact previewed sequence and its companion HTML report. Import the XML into Premiere Pro or a compatible editor to review playback and render the movie. This app does not render an MP4 in this workflow.
+
+Loading footage, analyzing music, building, and exporting run in workers. **Stop** requests cancellation where supported; an operation already writing output finishes safely. Closing the app waits for active work to stop. The hidden-console fix applies to every media helper.
+
+Editor folders, music and edit settings are remembered in `data/music_video_settings.json`, separately from the library's normal source and destination. Opening the app does not automatically scan those folders. If you have reviewed videos in the library, **Use N clips from library review** imports those included clips explicitly.
+
+**Library & sorting** in the sidebar opens the existing detection, review, filing and face-crop tools. **Create music video** returns to the editor without discarding its current inputs or preview.
+
 ## Choosing a sort
 
 Use separate, non-overlapping source and output folders. The app scans supported image and video extensions recursively and preserves relative subfolders inside each category.
@@ -61,7 +77,7 @@ Crop filenames include a face number and receive a safe suffix on repeat export.
 
 ## PMV Forge & Comp Harvester
 
-- **PMV Forge:** Browse to a local audio track and analyze an estimated tempo grid. Four beats per bar are assumed; silence does not produce a usable grid. Changing music or requested tempo invalidates the previous result. Included, successfully analyzed video files are supplied from the current run; a folder can also be selected. Source metadata and bounds are checked before XML export. The output is an editing sequence, not a rendered movie. Imported playback in your target editor still needs review.
+- **Music video editor (PMV Forge):** Choose footage first, then music, build a cut-list preview, and export its editing sequence. Four beats per bar are assumed; silence does not produce a usable grid. Source metadata and bounds are checked before XML export. Imported playback in your target editor still needs review.
 - **Comp Harvester:** Choose **Fast copy** for unchanged compressed media with potentially approximate keyframe boundaries, or **Accurate cuts** to re-encode at requested boundaries with GPU encoding when available. Every run uses a separate output subfolder and records measured durations. Long scenes are divided into multiple takes. After extraction, **Open in Library & Review** loads that folder into source setup; choose a separate output and analyze to review it.
 - **Flight Report:** Opens an offline HTML summary with included/skipped state. Each run has a distinct report filename. A report catalog is metadata, not an embedded media player.
 

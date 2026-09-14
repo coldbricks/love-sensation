@@ -11,6 +11,8 @@ import subprocess
 from pathlib import Path
 from typing import Sequence
 
+from .process_options import background_process_options
+
 import numpy as np
 import torch
 
@@ -30,7 +32,8 @@ def load_mono_audio(path: Path | str, sr: int = SR) -> np.ndarray:
         "-",
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, check=True, timeout=180)
+        proc = subprocess.run(cmd, capture_output=True, check=True, timeout=180,
+                              **background_process_options())
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else str(exc)
         raise ValueError(f"Failed to decode audio file {path}: {stderr}") from exc

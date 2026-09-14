@@ -17,6 +17,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterator
 
+from .process_options import background_process_options
+
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"})
 ANIMATED_IMAGE_EXTENSIONS = frozenset({".gif"})
 VIDEO_SAMPLER_VERSION = "pts-select-v2"
@@ -26,7 +28,8 @@ def _run_media(cmd, *, timeout=120, cancel_event=None):
     """Capture both pipes without deadlock; cancellation terminates the child."""
     if cancel_event is not None and cancel_event.is_set():
         raise InterruptedError("Media operation cancelled")
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          **background_process_options()) as proc:
         deadline = time.monotonic() + timeout
         while True:
             try:
@@ -56,7 +59,7 @@ def _h264_encoder():
     """Check an actual NVENC encode, not just FFmpeg's compiled encoder list."""
     cmd = ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=size=320x240:rate=30",
            "-frames:v", "1", "-c:v", "h264_nvenc", "-f", "null", "-"]
-    result = subprocess.run(cmd, capture_output=True, timeout=15)
+    result = subprocess.run(cmd, capture_output=True, timeout=15, **background_process_options())
     if result.returncode == 0:
         logging.info("Accurate cuts: verified h264_nvenc")
         return "h264_nvenc"
@@ -107,7 +110,8 @@ def probe_media_file(path: Path) -> dict:
             str(path),
         ]
         result = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+            **background_process_options(),
         )
         if result.returncode == 0:
             data = json.loads(result.stdout)

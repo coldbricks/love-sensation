@@ -11,6 +11,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from .evidence import is_accepted_semantic
+
 TAG_COLORS = {
     "peak": "#e8c58a",      # Champagne gold
     "fill": "#ff8a65",      # Coral
@@ -214,6 +216,15 @@ def generate_flight_report(
         review_state = "Included" if r.get("included", True) else "Skipped"
         dur_str = f"{dur_val:.1f}s • " if dur_val > 0.0 else ""
         wow_lbl = f"{prom:.2f} PEAK / {sustained:.2f} SUSTAINED" if sustained > 0 else f"{prom:.2f} WOW"
+        semantic = [d for d in (r.get("detections") or []) if is_accepted_semantic(d, _categories(r))]
+        evidence_label = ""
+        if semantic:
+            margin = max(float(d["raw_margin"]) for d in semantic)
+            evidence_label = f"Image-level covered-body match · margin {margin:+.2f} (not a probability)"
+            if not (r.get("geometry_available") or r.get("best_box")):
+                wow_lbl = "Region not localized"
+            if r.get("media_type") == "video":
+                evidence_label += f" · matching sample {_number(r.get('best_match_timestamp_s')):.2f}s"
         items_html.append(f"""
         <div class="media-card" data-name="{name.lower()}" data-cats="{html.escape(cats.lower())}" data-type="{m_type.lower()}" data-review-state="{review_state.lower()}">
             <div class="card-top">
@@ -222,6 +233,7 @@ def generate_flight_report(
             </div>
             <div class="file-name" title="{name}">{name}</div>
             <div class="card-cats">{html.escape(cats)}</div>
+            <div class="card-cats">{html.escape(evidence_label)}</div>
             <div class="review-state">{review_state} in this review</div>
         </div>
         """)

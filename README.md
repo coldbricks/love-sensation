@@ -6,7 +6,7 @@
 
 # L O V E &nbsp; S E N S A T I O N
 
-### Private media review and video tools for Windows 11
+### Local music-video editing and library tools for Windows 11
 
 **Rhythm Intelligence. Scale-Invariant Neural Sorting. Zero Cloud Footprint.**<br>
 *Engineered from the silicon up for local NVIDIA CUDA FP16 tensor compute.*
@@ -38,6 +38,8 @@
 ---
 
 ## Architecture at a Glance
+
+The app now opens in **Create music video**: **Choose footage folder → Choose music → Build timeline → Export XML**. The footage picker is visible from the start, includes subfolders when selected, and reports loaded and skipped clips. No classification or sorting run is required. Review the cut list before exporting; source probing and export run in the background. **Library & sorting** remains available in the sidebar. XML output is an editable sequence; playback review and final movie rendering take place in your video editor.
 
 ### New in 2.1: Library & Review
 
@@ -132,6 +134,14 @@ Don't let multi-hour compilations sit in a folder unindexed. The **Comp Harveste
 ---
 
 ## Scale-Invariant Spatial Intelligence
+
+Covered buttocks also use a local **SigLIP 2 SO400M** image classifier alongside NudeNet. This helps recognize clothed rear views and close, distorted camera views that the region detector can miss. Select **Buttocks Covered** to include these matches. NudeNet's confidence threshold remains unchanged; the additional classifier compares fixed covered-body descriptions with competing descriptions and requires a positive logit margin. A margin is not a confidence percentage.
+
+Image matches are labeled **Region not localized** when there is no qualifying detection box. They do not provide a body outline, skeleton, pose, prominence, or aspect measurement. For videos, the matching sample time is retained; sampling is still capped at 24 frames per clip and can miss brief appearances. Minimum geometry filters exclude matches without measured geometry.
+
+Both models run locally, defaulting to CUDA FP16 when available. First-time setup downloads about 4.6 GB of additional public model files and verifies their hashes. Subsequent inference loads those files offline. Private images, embeddings, and model outputs are not sent to a remote inference service. The model and prompt revision are part of the analysis-cache identity, so earlier NudeNet-only results are reanalyzed.
+
+The initial local acceptance set passed 32 of 32 user-confirmed covered-body examples and rejected nine background, synthetic, and frontal-upper-body controls. This small set establishes those examples' image-level recognition, not general accuracy or localization quality. The private test images are not included in this repository. The earlier NudeNet-only throughput numbers below do not apply to the combined pipeline.
 
 Raw confidence scores are misleading—a tiny peripheral element in the corner should never outrank a centered focal subject. Love Sensation implements scale-invariant geometric weighting:
 
@@ -228,4 +238,4 @@ Validated locally on Windows 11 with an **NVIDIA GeForce RTX 5090 Laptop GPU (24
 ## License & Provenance
 
 Application source is released under the [AGPL-3.0 License](LICENSE).  
-Love Sensation utilizes PySide6, PyTorch, torchvision, Ultralytics, and the NudeNet 640m detector. Third-party components retain their respective licenses. Model weights are downloaded automatically on first run and are never committed to this repository. See [third-party notices](THIRD_PARTY.md) for full provenance records.
+Love Sensation utilizes PySide6, PyTorch, torchvision, Ultralytics, Transformers, the NudeNet 640m detector, and Google's SigLIP 2 SO400M model. Third-party components retain their respective licenses. Model weights are downloaded automatically on first run and are never committed to this repository. See [third-party notices](THIRD_PARTY.md) for full provenance records.

@@ -8,6 +8,8 @@ import math
 from typing import Sequence
 import numpy as np
 
+from .evidence import is_semantic
+
 # Focal priority weights for visual interest centering
 FOCAL_TARGET_WEIGHTS = {
     "BUTTOCKS_EXPOSED": 1.00,
@@ -107,6 +109,8 @@ def evaluate_frame_detections(
     faces = []
 
     for det in detections:
+        if is_semantic(det):
+            continue
         cls_name = det.get("class", "")
         if selected_classes and cls_name not in selected_classes:
             continue
@@ -117,6 +121,9 @@ def evaluate_frame_detections(
 
         det["prominence"] = round(prom, 4)
         det["aspect"] = round(aspect, 4)
+
+        if box_area(box) <= 0:
+            continue
 
         if "FACE" in cls_name:
             faces.append(box)
@@ -163,6 +170,8 @@ def ken_burns_focal_point(
     best_center = (frame_width // 2, frame_height // 2)
 
     for det in detections:
+        if is_semantic(det):
+            continue
         cls_name = det.get("class", "")
         weight = FOCAL_TARGET_WEIGHTS.get(cls_name, 0.2)
         conf = float(det.get("score", 0.0))

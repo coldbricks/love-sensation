@@ -99,6 +99,46 @@ class ReviewUiTests(unittest.TestCase):
         self.window.table.setFocus()
         self.app.processEvents()
 
+    def test_music_editor_is_the_starting_page_and_library_remains_accessible(self):
+        fresh = ui.create_window()
+        try:
+            self.assertIs(fresh.main_pages.currentWidget(), fresh._music_editor)
+            self.assertEqual("Create music video", fresh.pmv_forge_button.text())
+            self.assertIsNone(fresh._music_editor._worker, "Opening the app must not scan a private folder")
+            fresh.library_button.click()
+            self.assertIs(fresh.main_pages.currentWidget(), fresh.library_page)
+            fresh.pmv_forge_button.click()
+            self.assertIs(fresh.main_pages.currentWidget(), fresh._music_editor)
+        finally:
+            fresh.close()
+            fresh.deleteLater()
+
+    def test_editor_privacy_resume_keeps_current_workspace(self):
+        self.window._open_pmv_forge()
+        self.window._set_privacy(True)
+        self.window._set_privacy(False)
+        self.assertIs(self.window.main_pages.currentWidget(), self.window._music_editor)
+
+    def test_close_waits_for_editor_footage_worker(self):
+        gate = threading.Event()
+        def load(*args, **kwargs):
+            gate.wait(3)
+            return {"clips": [], "skipped": [], "cancelled": True}
+        self.window._open_pmv_forge()
+        editor = self.window._music_editor
+        editor.footage_edit.setText(str(self.source))
+        with patch('platinum_sorter.pmv_dialog.scan_clip_folder', side_effect=load):
+            editor._start_footage_load()
+            try:
+                self.window.close()
+                self.assertTrue(self.window._close_requested)
+                self.assertTrue(editor.is_busy())
+                self.assertTrue(self.window.isVisible())
+            finally:
+                gate.set()
+                self.wait_until(lambda: not editor.is_busy())
+                self.wait_until(lambda: not self.window.isVisible())
+
     def test_exclude_filtered_selection_preserves_hidden_rows_and_persists_review(self):
         self.select_filtered("exclude.png")
         self.window.exclude_button.click()

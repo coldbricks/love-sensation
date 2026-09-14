@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from .contracts import Detector, EventSink, ImageResult, ScanReport, SortOptions
+from .evidence import accepts_detection, evidence_sort_key, is_semantic
 
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff"})
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"})
@@ -34,7 +35,7 @@ _CHUNK_SIZE = 1024 * 1024
 # Larger individual files retain the streaming signature/path adapter.
 _SNAPSHOT_BATCH_BYTES = 64 * 1024 * 1024
 _APPLIED = frozenset({"copied", "moved", "hardlinked"})
-_ANALYSIS_CACHE_VERSION = "raw-dimensions-v2"
+_ANALYSIS_CACHE_VERSION = "raw-evidence-v3"
 _VIDEO_MAX_FRAMES = 24
 
 
@@ -328,14 +329,35 @@ def _clean_detections(detections) -> list[dict]:
     for item in detections:
         if not isinstance(item, dict) or not isinstance(item.get("class"), str) or not item["class"]:
             raise ValueError("Detector returned a detection without a class label.")
-        score = float(item["score"])
-        if not math.isfinite(score) or not 0 <= score <= 1:
-            raise ValueError("Detector returned an invalid confidence score.")
         box = [float(number) for number in item.get("box", [])]
         if box and (len(box) != 4 or not all(math.isfinite(number) for number in box)):
             raise ValueError("Detector returned an invalid bounding box.")
-        record = {"class": item["class"], "score": score, "box": box}
-        for key in ("prominence", "aspect"):
+        if is_semantic(item):
+            if (item["class"] != "BUTTOCKS_COVERED" or box or "score" in item
+                    or item.get("scope") != "image" or item.get("score_kind") != "logit_margin"):
+                raise ValueError("Detector returned invalid image-level semantic evidence.")
+            record = {"class": item["class"], "box": [], "source": "siglip2",
+                      "scope": "image", "score_kind": "logit_margin"}
+            for key in ("raw_margin", "positive_logit", "negative_logit"):
+                value = float(item[key])
+                if not math.isfinite(value):
+                    raise ValueError(f"Detector returned an invalid semantic {key}.")
+                record[key] = value
+            for key in ("model_revision", "prompt_revision"):
+                if not isinstance(item.get(key), str) or not item[key]:
+                    raise ValueError(f"Detector returned an invalid semantic {key}.")
+                record[key] = item[key]
+        else:
+            score = float(item["score"])
+            if not math.isfinite(score) or not 0 <= score <= 1:
+                raise ValueError("Detector returned an invalid confidence score.")
+            record = {"class": item["class"], "score": score, "box": box}
+            for key in ("source", "scope", "score_kind"):
+                if key in item:
+                    if not isinstance(item[key], str) or not item[key]:
+                        raise ValueError(f"Detector returned an invalid {key}.")
+                    record[key] = item[key]
+        for key in (("timestamp_s",) if is_semantic(item) else ("prominence", "aspect", "timestamp_s")):
             if key in item:
                 value = float(item[key])
                 if not math.isfinite(value) or value < 0:
@@ -398,32 +420,42 @@ def _apply_payload(result: ImageResult, payload: dict, options: SortOptions) -> 
     from .metrics import evaluate_frame_detections, sustained_85th_percentile
     _validate_payload(payload, result.media_type)
     frames = payload["frames"] if result.media_type == "video" else [payload]
-    allowed = set(options.selected_classes)
     result.detections = []
     scores = []
     peak = -1.0
     result.prominence = result.aspect_ratio = result.sustained_wow = 0.0
     result.best_box = []
     result.best_timestamp_s = 0.0
+    result.geometry_available = False
+    result.best_match_timestamp_s = 0.0
+    best_semantic_margin = float("-inf")
     result.width, result.height = frames[0]["width"], frames[0]["height"]
     for frame in frames:
         detections = _clean_detections(frame["detections"])
         # Enrich every record for category filters, then summarize only the
         # currently selected classes above the user's confidence threshold.
         evaluate_frame_detections(detections, frame["width"], frame["height"])
-        selected = [d for d in detections if d["score"] >= options.threshold and
-                    (not allowed or d["class"] in allowed) and
-                    d.get("prominence", d["score"]) >= options.min_prominence and
-                    d.get("aspect", 0.0) >= options.min_aspect_ratio]
+        for detection in detections:
+            detection["accepted"] = accepts_detection(detection, options)
+        selected = [d for d in detections if d["accepted"]]
+        timestamp = float(frame.get("timestamp_s", 0.0))
+        if result.media_type == "video":
+            for detection in detections:
+                detection["timestamp_s"] = timestamp
+        for detection in selected:
+            if is_semantic(detection) and detection["raw_margin"] > best_semantic_margin:
+                best_semantic_margin = detection["raw_margin"]
+                result.best_match_timestamp_s = timestamp
         summary = evaluate_frame_detections(selected, frame["width"], frame["height"])
         scores.append(summary["max_prominence"])
-        if summary["max_prominence"] > peak:
+        if summary["best_detection"] is not None and summary["max_prominence"] > peak:
             peak = summary["max_prominence"]
             result.prominence = peak
             result.aspect_ratio = summary["max_aspect"]
-            result.best_timestamp_s = float(frame.get("timestamp_s", 0.0))
+            result.best_timestamp_s = timestamp
             best = summary["best_detection"]
             result.best_box = [int(round(v)) for v in best["box"]] if best else []
+            result.geometry_available = True
         result.detections.extend(detections)
     result.categories = _select_categories(result.detections, options)
     if result.media_type == "video":
@@ -463,25 +495,18 @@ def _create_hardlink_win32(source: Path, destination: Path) -> bool:
 
 
 def _select_categories(detections: list[dict], options: SortOptions) -> list[str]:
-    allowed = set(options.selected_classes)
-    best: dict[str, float] = {}
+    best: dict[str, tuple[int, float]] = {}
     for detection in detections:
-        label, confidence = detection["class"], detection["score"]
-        prominence = float(detection.get("prominence", confidence))
-        aspect = float(detection.get("aspect", 0.0))
-        if confidence >= options.threshold and (not allowed or label in allowed):
-            if options.min_prominence > 0.0 and prominence < options.min_prominence:
-                continue
-            if options.min_aspect_ratio > 0.0 and aspect < options.min_aspect_ratio:
-                continue
-            if options.rank_mode == "prominence":
-                score_val = prominence
-            elif options.rank_mode == "aspect":
-                score_val = aspect
-            else:
-                score_val = confidence
-            best[label] = max(score_val, best.get(label, 0.0))
-    categories = sorted(best, key=lambda label: (-best[label], label))
+        if accepts_detection(detection, options):
+            label = detection["class"]
+            score_val = evidence_sort_key(detection)
+            if not is_semantic(detection):
+                if options.rank_mode == "prominence":
+                    score_val = (score_val[0], float(detection.get("prominence", detection["score"])))
+                elif options.rank_mode == "aspect":
+                    score_val = (score_val[0], float(detection.get("aspect", 0.0)))
+            best[label] = max(score_val, best.get(label, score_val))
+    categories = sorted(best, key=lambda label: (-best[label][0], -best[label][1], label))
     if options.mode == "best":
         categories = categories[:1]
     elif options.mode == "top3":
@@ -1113,7 +1138,7 @@ def export_report(report: ScanReport, path: Path) -> None:
         if path.exists() and _is_link(path):
             raise ValueError(f"Refusing to replace a linked report: {path}")
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        fields = ["source", "relative_path", "size", "mtime_ns", "sha256", "status", "categories", "destinations", "error", "cached", "detections", "output_details"]
+        fields = ["source", "relative_path", "size", "mtime_ns", "sha256", "status", "categories", "destinations", "error", "cached", "detections", "output_details", "geometry_available", "best_match_timestamp_s"]
         try:
             with temporary.open("x", encoding="utf-8-sig", newline="") as file:
                 writer = csv.DictWriter(file, fieldnames=fields)

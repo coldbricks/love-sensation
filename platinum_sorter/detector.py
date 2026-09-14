@@ -1,4 +1,4 @@
-"""Local NudeNet 640m inference. All numerical image/model work defaults to CUDA."""
+"""Local object detections plus covered-rear evidence; numerical work defaults to CUDA."""
 from __future__ import annotations
 
 import hashlib
@@ -12,6 +12,7 @@ import time
 import urllib.request
 
 from .contracts import DetectionResult
+from .covered_semantic import CoveredSemantic, ensure_semantic_model
 
 LABELS = [
     "FEMALE_GENITALIA_COVERED", "FACE_FEMALE", "BUTTOCKS_EXPOSED",
@@ -24,6 +25,7 @@ LABELS = [
 MODEL_SHA256 = "e6d7cddecc4417ff62db5b92c1c9f5d0d7b0f92e6cfd562120aea59a6ec3af3f"
 MODEL_URL = "https://api.github.com/repos/notAI-tech/NudeNet/releases/assets/176832117"
 MODEL_SIZE = 52023681
+INFERENCE_GROUP_SIZE = 2
 
 
 def file_hash(path: Path) -> str:
@@ -60,18 +62,24 @@ class GpuDetector:
         self.emit = emit
         self.model_dir = Path(model_dir)
         os.environ.setdefault("YOLO_CONFIG_DIR", str(self.model_dir.parent / "data" / "ultralytics"))
+        os.environ["YOLO_OFFLINE"] = "true"
+        os.environ["YOLO_AUTOINSTALL"] = "false"
         # CUDA imports stay out of the GUI startup path.
         import torch
         import torch.nn.functional as functional
-        from ultralytics import YOLO
+        from ultralytics import YOLO, settings
         from ultralytics.utils.nms import non_max_suppression
+
+        settings.update({"sync": False})
 
         self.torch, self.functional, self.nms = torch, functional, non_max_suppression
         self.cuda = torch.cuda.is_available()
         self.device = torch.device("cuda:0" if self.cuda else "cpu")
         self.dtype = torch.float16 if self.cuda else torch.float32
         self._cuda_jpeg = None
+        # Complete public asset provisioning before decoding any private input.
         path = ensure_model(self.model_dir, emit)
+        semantic_directory = ensure_semantic_model(self.model_dir, emit)
         emit({"type": "status", "message": "Loading 640m and verifying the compute device..."})
         wrapper = YOLO(str(path), task="detect")
         actual_labels = [wrapper.names[index] for index in range(len(wrapper.names))]
@@ -107,7 +115,11 @@ class GpuDetector:
             raise RuntimeError("GPU was requested but the warm-up convolution did not run on CUDA.")
         self.info["cuda_verified"] = self.cuda and observed.get("device") == "cuda:0"
         self.info["verified_convolution"] = observed
-        self.fingerprint = f"640m:{MODEL_SHA256}:torch-square-v1:{self.info['precision']}"
+        self.semantic = CoveredSemantic(semantic_directory, self.device, emit)
+        self.info["model"] = "NudeNet 640m + SigLIP2 covered-body evidence"
+        self.info["covered_semantic"] = dict(self.semantic.info)
+        self.info["inference_group_size"] = INFERENCE_GROUP_SIZE
+        self.fingerprint = f"640m:{MODEL_SHA256}:torch-square-v1:{self.info['precision']}|{self.semantic.fingerprint}"
         self.emit({"type": "device", "info": dict(self.info)})
         logging.info("Detector verified: %s", self.info)
         print(json.dumps(self.info), flush=True)
@@ -120,6 +132,9 @@ class GpuDetector:
         )
 
     def _prepare(self, source: Path | bytes):
+        return self._resize(self._decode(source))
+
+    def _decode(self, source: Path | bytes):
         import numpy as np
         from PIL import Image, ImageOps
         torch = self.torch
@@ -151,7 +166,7 @@ class GpuDetector:
                 rgb = ImageOps.exif_transpose(image).convert("RGB")
                 array = np.asarray(rgb).copy()
                 tensor = torch.from_numpy(array).permute(2, 0, 1).to(self.device)
-        return self._resize(tensor)
+        return tensor
 
     def _resize(self, tensor):
         height, width = tensor.shape[-2:]
@@ -171,53 +186,72 @@ class GpuDetector:
         return self._detect_batch(images)
 
     def _detect_batch(self, sources: list[Path | bytes]) -> list[list[dict] | Exception]:
+        # Keep decoded full-resolution tensors bounded as well as model batches.
+        outputs = []
+        for start in range(0, len(sources), INFERENCE_GROUP_SIZE):
+            outputs.extend(self._detect_with_retry(sources[start:start + INFERENCE_GROUP_SIZE]))
+        return outputs
+
+    def _detect_with_retry(self, sources: list[Path | bytes]) -> list[list[dict] | Exception]:
+        # Catch outside _detect_group so its intermediate tensors are released
+        # before retrying. A failed semantic stage never becomes a false empty result.
+        try:
+            return self._detect_group(sources)
+        except self.torch.cuda.OutOfMemoryError:
+            message = "GPU memory exhausted during combined image inference."
+            memory_error = True
+        except Exception as error:
+            message = str(error)
+            memory_error = False
+        if memory_error and self.cuda:
+            self.torch.cuda.empty_cache()
+        if len(sources) == 1:
+            return [RuntimeError(message)]
+        middle = len(sources) // 2
+        return self._detect_with_retry(sources[:middle]) + self._detect_with_retry(sources[middle:])
+
+    def _detect_group(self, sources: list[Path | bytes]) -> list[list[dict] | Exception]:
         torch = self.torch
         outputs: list[list[dict] | Exception] = [RuntimeError("Image not processed") for _ in sources]
-        valid, prepared, metadata = [], [], []
+        valid, prepared, metadata, decoded = [], [], [], []
         with torch.inference_mode():
             for index, source in enumerate(sources):
                 try:
-                    tensor, dimensions = self._prepare(source)
+                    original = self._decode(source)
+                    tensor, dimensions = self._resize(original)
                     valid.append(index)
                     prepared.append(tensor)
                     metadata.append(dimensions)
+                    decoded.append(original)
+                except torch.cuda.OutOfMemoryError:
+                    raise
                 except Exception as error:
                     outputs[index] = error
             if not prepared:
                 return outputs
+            predictions = self._predict(torch.stack(prepared))
             try:
-                batch = torch.stack(prepared)
-                predictions = self._predict(batch)
-                for position, detections in enumerate(predictions):
-                    width, height, scale = metadata[position]
-                    # Box scaling/clamping is also on the GPU; only final records come back to Python.
-                    detections = detections.float()
-                    detections[:, :4] *= scale
-                    detections[:, [0, 2]] = detections[:, [0, 2]].clamp(0, width)
-                    detections[:, [1, 3]] = detections[:, [1, 3]].clamp(0, height)
-                    records = []
-                    for x1, y1, x2, y2, score, category in detections.cpu().tolist():
-                        if x2 > x1 and y2 > y1:
-                            records.append({"class": LABELS[int(category)], "score": float(score),
-                                            "box": [round(x1), round(y1), round(x2-x1), round(y2-y1)]})
-                    outputs[valid[position]] = DetectionResult(records, width=width, height=height)
-                if self.cuda:
-                    torch.cuda.synchronize(self.device)
+                semantic_records = self.semantic.predict(decoded)
             except torch.cuda.OutOfMemoryError:
-                # Retain GPU execution and reduce batch size, never silently switch to CPU.
-                prepared.clear()
-                if "batch" in locals():
-                    del batch
-                torch.cuda.empty_cache()
-                if len(valid) == 1:
-                    outputs[valid[0]] = RuntimeError("GPU memory exhausted for this image.")
-                else:
-                    middle = len(valid) // 2
-                    for indices in (valid[:middle], valid[middle:]):
-                        partial = self._detect_batch([sources[index] for index in indices])
-                        for index, result in zip(indices, partial):
-                            outputs[index] = result
+                raise
             except Exception as error:
-                for index in valid:
-                    outputs[index] = error
+                raise RuntimeError(f"Covered-body inference failed: {error}") from error
+            if len(predictions) != len(valid) or len(semantic_records) != len(valid):
+                raise RuntimeError("Combined inference returned an incomplete image batch.")
+            for position, detections in enumerate(predictions):
+                width, height, scale = metadata[position]
+                # Preserve NudeNet's categories, confidence values, and real boxes.
+                detections = detections.float()
+                detections[:, :4] *= scale
+                detections[:, [0, 2]] = detections[:, [0, 2]].clamp(0, width)
+                detections[:, [1, 3]] = detections[:, [1, 3]].clamp(0, height)
+                records = []
+                for x1, y1, x2, y2, score, category in detections.cpu().tolist():
+                    if x2 > x1 and y2 > y1:
+                        records.append({"class": LABELS[int(category)], "score": float(score),
+                                        "box": [round(x1), round(y1), round(x2-x1), round(y2-y1)]})
+                records.append(semantic_records[position])
+                outputs[valid[position]] = DetectionResult(records, width=width, height=height)
+            if self.cuda:
+                torch.cuda.synchronize(self.device)
         return outputs

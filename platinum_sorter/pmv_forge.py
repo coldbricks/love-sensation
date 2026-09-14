@@ -374,8 +374,14 @@ def export_fcp7_xml(
     width: int = 1920,
     height: int = 1080,
     sequence_name: str = "Love Sensation PMV",
+    cancel_event=None,
 ) -> Path:
     """Export frame-quantized Final Cut Pro 7 / Premiere Pro XML with gapless continuity and stereo audio."""
+    def check_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("Export stopped before writing the sequence.")
+
+    check_cancelled()
     output_xml_path = Path(output_xml_path)
     audio_path = Path(audio_path)
     output_xml_path.parent.mkdir(parents=True, exist_ok=True)
@@ -391,6 +397,7 @@ def export_fcp7_xml(
         raise ValueError("The soundtrack has no readable audio stream")
     metadata = {}
     for cut in cuts:
+        check_cancelled()
         if cut.clip_path not in metadata:
             metadata[cut.clip_path] = prepare_candidate_clips([{"path": cut.clip_path}])[0]
         info = metadata[cut.clip_path]
@@ -588,5 +595,6 @@ def export_fcp7_xml(
         '</xmeml>',
     ])
 
+    check_cancelled()
     output_xml_path.write_text("\n".join(xml_lines), encoding="utf-8")
     return output_xml_path

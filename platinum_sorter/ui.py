@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from .contracts import ImageResult, ScanReport, SortOptions
+from .evidence import evidence_sort_key, is_accepted_semantic, is_semantic
 from . import __version__
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -139,6 +140,35 @@ def _readable(value: str) -> str:
     return value.replace("_", " ").strip().title()
 
 
+def _evidence_text(item: dict) -> str:
+    if is_semantic(item):
+        if item['raw_margin'] <= 0:
+            return f"No covered-body image match · margin {item['raw_margin']:+.2f}"
+        return f"Image match · margin {item['raw_margin']:+.2f} · Region not localized"
+    return f"Localized detection · {float(item.get('score', 0)):.0%}"
+
+
+def _display_evidence(result: ImageResult) -> dict | None:
+    semantic = [d for d in result.detections if is_accepted_semantic(d, result.categories)]
+    if semantic:
+        return max(semantic, key=evidence_sort_key)
+    return max((d for d in result.detections if not is_semantic(d)), key=evidence_sort_key, default=None)
+
+
+def _match_text(result: ImageResult) -> str:
+    evidence = _display_evidence(result)
+    if evidence is None:
+        return "—"
+    if is_semantic(evidence):
+        return f"Image match ({evidence['raw_margin']:+.2f})"
+    return f"{float(evidence['score']):.0%}"
+
+
+def _unlocalized_match(result: ImageResult) -> bool:
+    return (any(is_accepted_semantic(d, result.categories) for d in result.detections)
+            and not (getattr(result, 'geometry_available', False) or result.best_box))
+
+
 def _moon_spoon_pixmap(width: int = 176, height: int = 72, *, compact: bool = False) -> QPixmap:
     """Original chrome moon profile and spoon, drawn as crisp vector paths."""
     pixmap = QPixmap(width, height)
@@ -220,7 +250,7 @@ def _brand_icon() -> QIcon:
 
 
 class ResultsModel(QAbstractTableModel):
-    HEADERS = ("FILE", "CATEGORIES", "CONFIDENCE", "STATUS")
+    HEADERS = ("FILE", "CATEGORIES", "MATCH EVIDENCE", "STATUS")
     review_requested = Signal(object, bool)
 
     def __init__(self, parent=None):
@@ -268,6 +298,7 @@ class ResultsModel(QAbstractTableModel):
             return str(self.data(index, Qt.ItemDataRole.DisplayRole)).casefold()
         if role == Qt.ItemDataRole.ToolTipRole:
             lines = [result.source]
+            lines.extend(_evidence_text(d) for d in result.detections if is_semantic(d))
             if result.error:
                 lines.append(result.error)
             lines.extend(result.destinations)
@@ -278,11 +309,10 @@ class ResultsModel(QAbstractTableModel):
             if index.column() == 3:
                 return QColor("#e0c58f" if result.destinations else "#c1b8c5")
         if role == Qt.ItemDataRole.DisplayRole:
-            scores = [float(item.get("score", 0)) for item in result.detections]
             values = (
                 result.relative_path or Path(result.source).name,
                 ", ".join(_readable(category) for category in result.categories) or ("—" if _has_error(result) else "Unmatched"),
-                f"{max(scores):.0%}" if scores else "—",
+                _match_text(result),
                 ("Skipped by you" if not result.included and _reviewable(result) else _readable(result.status))
                 + (" · edited" if result.original_categories is not None else "") + (" · cached" if result.cached else ""),
             )
@@ -315,6 +345,15 @@ class ResultsFilter(QSortFilterProxyModel):
         self.kind = "all"
         self.setDynamicSortFilter(True)
         self.setSortRole(Qt.ItemDataRole.UserRole + 1)
+
+    def lessThan(self, left, right):
+        if left.column() == right.column() == 2:
+            results = self.sourceModel().results
+            def key(index):
+                evidence = _display_evidence(results[index.row()])
+                return evidence_sort_key(evidence) if evidence is not None else (-1, 0)
+            return key(left) < key(right)
+        return super().lessThan(left, right)
 
     def filterAcceptsRow(self, row, parent):
         result = self.sourceModel().results[row]
@@ -438,12 +477,16 @@ class StealthLoupe(QFrame):
         prom = getattr(result, "prominence", 0.0)
         sustained = getattr(result, "sustained_wow", 0.0)
         aspect = getattr(result, "aspect_ratio", 0.0)
-        if sustained > 0:
+        if _unlocalized_match(result):
+            self.score_lbl.setText("Region not localized")
+        elif sustained > 0:
             self.score_lbl.setText(f"{sustained:.2f} SUSTAINED (Peak {prom:.2f})")
         else:
             self.score_lbl.setText(f"{prom:.2f} WOW")
 
         info_lines = []
+        if _unlocalized_match(result) and result.media_type == "video":
+            info_lines.append(f"Matching sample: {result.best_match_timestamp_s:.1f}s")
         if getattr(result, "duration_s", 0.0) > 0:
             info_lines.append(f"Duration: {result.duration_s:.1f}s")
         if getattr(result, "best_timestamp_s", 0.0) > 0:
@@ -520,6 +563,7 @@ class MainWindow(QMainWindow):
         self._load_settings()
         self._connect_options()
         self._refresh_actions()
+        self._open_pmv_forge()
         QApplication.instance().installEventFilter(self)
 
     def _build_ui(self):
@@ -558,30 +602,32 @@ class MainWindow(QMainWindow):
         brand = _label("LOVE\nSENSATION")
         brand.setStyleSheet("font-family: 'Century Gothic'; font-size: 24px; font-weight: 700; letter-spacing: 0.5px; color: #e8e2dd; background: transparent;")
         side.addWidget(brand)
-        side.addWidget(_label("PRIVATE MEDIA WORKSPACE", "eyebrow"))
+        side.addWidget(_label("LOCAL VIDEO WORKSPACE", "eyebrow"))
         side.addSpacing(34)
         side.addWidget(_label("WORKSPACE", "eyebrow"))
         side.addSpacing(8)
-        active_nav = _label("Library & Review", "activeNav")
-        active_nav.setStyleSheet("background: #343036; border: 1px solid #6a5a49; border-radius: 6px; color: #f3dfbb; padding: 12px; font-weight: 600;")
-        side.addWidget(active_nav)
+        self.pmv_forge_button = QPushButton("Create music video")
+        self.pmv_forge_button.setObjectName("apply")
+        self.pmv_forge_button.setToolTip("Choose footage and music, preview the cuts, and export an editing sequence.")
+        self.pmv_forge_button.clicked.connect(self._open_pmv_forge)
+        side.addWidget(self.pmv_forge_button)
+        self.library_button = QPushButton("Library && sorting")
+        self.library_button.clicked.connect(self._show_library)
+        side.addWidget(self.library_button)
         side.addSpacing(28)
-        side.addWidget(_label("YOUR WORKFLOW", "eyebrow"))
+        self.workflow_label = _label("MUSIC VIDEO WORKFLOW", "eyebrow")
+        side.addWidget(self.workflow_label)
         side.addSpacing(12)
         self.step_labels = []
-        for text in ("01   Analyze your folder", "02   Review the results", "03   Apply sorting"):
+        for text in ("01   Choose footage", "02   Choose music & edit", "03   Preview & export"):
             step = _label(text, "muted")
             step.setContentsMargins(0, 7, 0, 7)
             self.step_labels.append(step)
             side.addWidget(step)
         side.addSpacing(20)
-        side.addWidget(_label("WORKSTATION SUITE", "eyebrow"))
+        side.addWidget(_label("TOOLS", "eyebrow"))
         side.addSpacing(8)
-        self.pmv_forge_button = QPushButton("PMV Forge…")
-        self.pmv_forge_button.setToolTip("Auto-assemble beat-locked video edits to music.")
-        self.pmv_forge_button.clicked.connect(self._open_pmv_forge)
-        side.addWidget(self.pmv_forge_button)
-        self.harvester_button = QPushButton("Comp Harvester…")
+        self.harvester_button = QPushButton("Split long videos…")
         self.harvester_button.setToolTip("Split videos into clips with fast or accurate extraction.")
         self.harvester_button.clicked.connect(self._open_harvester)
         side.addWidget(self.harvester_button)
@@ -592,7 +638,7 @@ class MainWindow(QMainWindow):
         self.privacy_button = QPushButton("Hide workspace · Esc")
         self.privacy_button.clicked.connect(lambda: self._set_privacy(True))
         side.addWidget(self.privacy_button)
-        note = _label("Your files stay on this device.\nReview every run before sorting.", "muted")
+        note = _label("Your files stay on this device.\nOriginal footage stays in place while you edit.", "muted")
         note.setWordWrap(True)
         note.setStyleSheet("line-height: 1.4; color: #aaa6aa; font-size: 12px; background: transparent;")
         side.addWidget(note)
@@ -674,6 +720,7 @@ class MainWindow(QMainWindow):
         self.confidence_spin.setDecimals(2)
         self.confidence_spin.setValue(0.62)
         self.confidence_spin.setAccessibleName("Minimum confidence")
+        self.confidence_spin.setToolTip("Minimum confidence for localized detections. Covered-body image matches use a separate comparison of image descriptions; their margins are not percentages.")
         self.confidence_spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
         self.operation_combo = QComboBox()
         self.operation_combo.addItem("Copy originals", "copy")
@@ -939,7 +986,11 @@ class MainWindow(QMainWindow):
         right_layout.setSpacing(0)
         right_layout.addWidget(body_scroll, 1)
         right_layout.addWidget(footer)
-        shell.addWidget(right, 1)
+        self.main_pages = QStackedWidget()
+        self.library_page = right
+        self.main_pages.addWidget(right)
+        self._music_editor = None
+        shell.addWidget(self.main_pages, 1)
         self.search_edit.textChanged.connect(self._filter_results)
         self.filter_combo.currentIndexChanged.connect(self._filter_results)
 
@@ -1186,6 +1237,7 @@ class MainWindow(QMainWindow):
         self.device_label.setToolTip(json.dumps(info, indent=2, default=str))
 
     def _on_report(self, report: ScanReport):
+        self._show_library()
         loaded = self._phase == "load"
         if loaded:
             self._restore_options(report.options)
@@ -1305,10 +1357,16 @@ class MainWindow(QMainWindow):
         if len(rows) > 1:
             details.append(f"{len(rows)} files selected; inspecting the first")
         self.inspector_metadata.setText("\n".join(details))
-        matches = sorted(result.detections, key=lambda item: float(item.get("score", 0)), reverse=True)[:4]
+        localized = sorted((d for d in result.detections if not is_semantic(d)), key=evidence_sort_key, reverse=True)[:3]
+        semantic = [d for d in result.detections if is_semantic(d)]
+        matches = localized + sorted(semantic, key=evidence_sort_key, reverse=True)[:1]
         threshold = self.report.options.threshold if self.report else self.confidence_spin.value()
-        lines = [f"Model matches · threshold {threshold:.0%}"]
-        lines.extend(f"{_readable(item.get('class', ''))}: {float(item.get('score', 0)):.0%}" for item in matches)
+        lines = [f"Localized detection threshold: {threshold:.0%}"]
+        lines.extend(f"{_readable(item.get('class', ''))}: {_evidence_text(item)}" for item in matches)
+        if semantic:
+            lines.append("Image matches require a positive margin; this is not a confidence percentage.")
+        if _unlocalized_match(result) and result.media_type == "video":
+            lines.append(f"Matching sample: {result.best_match_timestamp_s:.2f}s")
         lines.append("Filed as: " + (", ".join(_readable(c) for c in result.categories) or "No category"))
         self.inspector_matches.setText("\n".join(lines))
         text = result.source
@@ -1415,19 +1473,40 @@ class MainWindow(QMainWindow):
                         "source": path,
                         "media_type": "video",
                         "duration_s": getattr(r, "duration_s", 5.0) or 5.0,
-                        "prominence": getattr(r, "prominence", 0.5) or 0.5,
+                        "prominence": getattr(r, "prominence", 0.0),
                         "sustained_wow": getattr(r, "sustained_wow", 0.0) or 0.0,
-                        "best_timestamp_s": getattr(r, "best_timestamp_s", 0.0) or 0.0,
-                        "aspect_ratio": getattr(r, "aspect_ratio", 1.0) or 1.0,
+                        "best_timestamp_s": r.best_match_timestamp_s if _unlocalized_match(r) else r.best_timestamp_s,
+                        "aspect_ratio": getattr(r, "aspect_ratio", 0.0),
+                        "geometry_available": getattr(r, "geometry_available", False),
                         "categories": r.categories,
                     })
-        dialog = PmvForgeDialog(parent=self, candidate_clips=clips)
-        dialog.exec()
+        if self._music_editor is None:
+            self._music_editor = PmvForgeDialog(parent=self, embedded=True,
+                settings_path=DATA_DIR / "music_video_settings.json",
+                default_source=self.source_edit.text())
+            self._music_editor.work_finished.connect(self._music_work_finished)
+            self.main_pages.addWidget(self._music_editor)
+        self._music_editor.set_review_candidates(clips)
+        self.main_pages.setCurrentWidget(self._music_editor)
+        self.workflow_label.setText("MUSIC VIDEO WORKFLOW")
+        for label, text in zip(self.step_labels, ("01   Choose footage", "02   Choose music & edit", "03   Preview & export")):
+            label.setText(text)
+
+    def _show_library(self):
+        self.main_pages.setCurrentWidget(self.library_page)
+        self.workflow_label.setText("LIBRARY WORKFLOW")
+        for label, text in zip(self.step_labels, ("01   Analyze your folder", "02   Review the results", "03   Apply sorting")):
+            label.setText(text)
+
+    def _music_work_finished(self):
+        if self._close_requested:
+            QTimer.singleShot(0, self.close)
 
     def _open_harvester(self):
         from .harvester_dialog import CompHarvesterDialog
         dialog = CompHarvesterDialog(parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.harvested_takes:
+            self._show_library()
             folder = Path(dialog.harvested_takes[0]).parent
             self.source_edit.setText(str(folder))
             self.setup_toggle.setChecked(True)
@@ -1585,6 +1664,13 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._save_settings()
         self._hide_preview()
+        if self._music_editor is not None:
+            self._music_editor._save_preferences()
+            if self._music_editor.is_busy():
+                self._close_requested = True
+                self._music_editor.request_stop()
+                event.ignore()
+                return
         if self._preview_worker is not None and self._preview_worker.isRunning():
             self._close_requested = True
             event.ignore()
